@@ -1,4 +1,4 @@
-/* Copyright (c) 2016 Baidu, Inc. All Rights Reserve.
+/* Copyright (c) 2016 PaddlePaddle Authors. All Rights Reserve.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -12,9 +12,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
 
-
 #include "Evaluator.h"
 #include "paddle/gserver/gradientmachines/NeuralNetwork.h"
+#include "paddle/utils/StringUtil.h"
 
 namespace paddle {
 
@@ -27,13 +27,15 @@ private:
   int numTimes_, numClasses_, numSequences_, blank_;
   real deletions_, insertions_, substitutions_;
   int seqClassficationError_;
+  mutable std::unordered_map<std::string, real> evalResults_;
 
   std::vector<int> path2String(const std::vector<int>& path) {
     std::vector<int> str;
     str.clear();
     int prevLabel = -1;
     for (std::vector<int>::const_iterator label = path.begin();
-         label != path.end(); label++) {
+         label != path.end();
+         label++) {
       if (*label != blank_ &&
           (str.empty() || *label != str.back() || prevLabel == blank_)) {
         str.push_back(*label);
@@ -58,8 +60,11 @@ private:
   /* "sp, dp, ip" is the weighting parameter of "substitution, deletion,
    * insertion"
    * in edit-distance error */
-  real stringAlignment(std::vector<int>& gtStr, std::vector<int>& recogStr,
-                       bool backtrace = true, real sp = 1.0, real dp = 1.0,
+  real stringAlignment(std::vector<int>& gtStr,
+                       std::vector<int>& recogStr,
+                       bool backtrace = true,
+                       real sp = 1.0,
+                       real dp = 1.0,
                        real ip = 1.0) {
     std::vector<std::vector<int>> matrix;
     int substitutions, deletions, insertions;
@@ -165,8 +170,8 @@ private:
     return distance / maxLen;
   }
 
-  real editDistance(real* output, int numTimes, int numClasses, int* labels,
-                    int labelsLen) {
+  real editDistance(
+      real* output, int numTimes, int numClasses, int* labels, int labelsLen) {
     numTimes_ = numTimes;
     numClasses_ = numClasses;
     blank_ = numClasses_ - 1;
@@ -178,6 +183,18 @@ private:
     }
 
     return stringAlignment(gtStr, recogStr);
+  }
+
+  void storeLocalValues() const {
+    evalResults_["error"] = numSequences_ ? totalScore_ / numSequences_ : 0;
+    evalResults_["deletion_error"] =
+        numSequences_ ? deletions_ / numSequences_ : 0;
+    evalResults_["insertion_error"] =
+        numSequences_ ? insertions_ / numSequences_ : 0;
+    evalResults_["substitution_error"] =
+        numSequences_ ? substitutions_ / numSequences_ : 0;
+    evalResults_["sequence_error"] =
+        (real)seqClassficationError_ / numSequences_;
   }
 
 public:
@@ -194,8 +211,8 @@ public:
   virtual real evalImp(std::vector<Argument>& arguments) {
     CHECK_EQ(arguments.size(), (size_t)2);
     Argument output, label;
-    output.resizeAndCopyFrom(arguments[0], false);
-    label.resizeAndCopyFrom(arguments[1], false);
+    output.resizeAndCopyFrom(arguments[0], false, HPPL_STREAM_DEFAULT);
+    label.resizeAndCopyFrom(arguments[1], false, HPPL_STREAM_DEFAULT);
     hl_stream_synchronize(HPPL_STREAM_DEFAULT);
     CHECK(label.sequenceStartPositions);
     CHECK(label.ids);
@@ -207,7 +224,8 @@ public:
       real err = 0;
       err = editDistance(
           output.value->getData() + output.value->getWidth() * outputStarts[i],
-          output.value->getHeight(), output.value->getWidth(),
+          outputStarts[i + 1] - outputStarts[i],
+          output.value->getWidth(),
           label.ids->getData() + labelStarts[i],
           labelStarts[i + 1] - labelStarts[i]);
 
@@ -224,6 +242,9 @@ public:
     for (const std::string& name : config_.input_layers()) {
       arguments.push_back(nn.getLayer(name)->getOutput());
     }
+  }
+
+  virtual void updateSamplesNum(const std::vector<Argument>& arguments) {
     numSequences_ += arguments[1].getNumSequences();
   }
 
@@ -237,17 +258,13 @@ public:
     seqClassficationError_ = 0;
   }
 
-  virtual void printStats(std::ostream& os) {
-    os << config_.name() << "="
-       << (numSequences_ ? totalScore_ / numSequences_ : 0);
-    os << "  deletions error"
-       << "=" << (numSequences_ ? deletions_ / numSequences_ : 0);
-    os << "  insertions error"
-       << "=" << (numSequences_ ? insertions_ / numSequences_ : 0);
-    os << "  substitutions error"
-       << "=" << (numSequences_ ? substitutions_ / numSequences_ : 0);
-    os << "  sequences error"
-       << "=" << (real)seqClassficationError_ / numSequences_;
+  virtual void printStats(std::ostream& os) const {
+    storeLocalValues();
+    os << config_.name() << " error = " << evalResults_["error"];
+    os << " deletions error = " << evalResults_["deletion_error"];
+    os << " insertions error = " << evalResults_["insertion_error"];
+    os << " substitution error = " << evalResults_["substitution_error"];
+    os << " sequence error = " << evalResults_["sequence_error"];
   }
 
   virtual void distributeEval(ParameterClient2* client) {
@@ -264,6 +281,37 @@ public:
     substitutions_ = (real)buf[3];
     seqClassficationError_ = (int)buf[4];
     numSequences_ = (int)buf[5];
+  }
+
+  void getNames(std::vector<std::string>* names) {
+    storeLocalValues();
+    names->reserve(names->size() + evalResults_.size());
+    for (auto it = evalResults_.begin(); it != evalResults_.end(); ++it) {
+      names->push_back(config_.name() + "." + it->first);
+    }
+  }
+
+  real getValue(const std::string& name, Error* err) const {
+    storeLocalValues();
+
+    std::vector<std::string> buffers;
+    paddle::str::split(name, '.', &buffers);
+    auto it = evalResults_.find(buffers[buffers.size() - 1]);
+
+    if (it == evalResults_.end()) {
+      *err = Error("Evaluator does not have the key %s", name.c_str());
+      return 0.0f;
+    }
+
+    return it->second;
+  }
+
+  std::string getType(const std::string& name, Error* err) const {
+    this->getValue(name, err);
+    if (!err->isOK()) {
+      return "";
+    }
+    return "ctc_edit_distance";
   }
 };
 

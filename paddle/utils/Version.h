@@ -1,4 +1,4 @@
-/* Copyright (c) 2016 Baidu, Inc. All Rights Reserve.
+/* Copyright (c) 2016 PaddlePaddle Authors. All Rights Reserve.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -12,11 +12,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
 
-
 #pragma once
 #include <stddef.h>
-#include "TypeDefs.h"
 #include <iostream>
+#include "Common.h"
 
 namespace paddle {
 
@@ -35,7 +34,6 @@ namespace paddle {
  *    real byte size: 4
  */
 
-
 namespace version {
 
 /**
@@ -44,14 +42,13 @@ namespace version {
  */
 void printVersion();
 
-
 void printVersion(std::ostream& os);
 /**
  * @brief isWithGpu
  * @return return true if paddle compiled with GPU
  */
 constexpr bool isWithGpu() {
-#ifdef PADDLE_ONLY_CPU
+#ifndef PADDLE_WITH_CUDA
   return false;
 #else
   return true;
@@ -74,7 +71,6 @@ constexpr bool isWithPyDataProvider() {
   return true;
 #endif
 }
-
 
 /**
  * @brief isWithTimer
@@ -116,25 +112,19 @@ constexpr bool isWithFpga() {
  * @brief sizeofReal
  * @return return the byte size of real
  */
-constexpr size_t sizeofReal() {
-  return sizeof(real);
-}
+constexpr size_t sizeofReal() { return sizeof(real); }
 
 /**
  * @brief isPaddleUseDouble
  * @return true if paddle compiled with double precision.
  */
-constexpr bool isPaddleUseDouble() {
-  return sizeofReal() == sizeof(double);
-}
+constexpr bool isPaddleUseDouble() { return sizeofReal() == sizeof(double); }
 
 /**
  * @brief isPaddleUseFloat
  * @return true if paddle compiled with float precision
  */
-constexpr bool isPaddleUseFloat() {
-  return sizeofReal() == sizeof(float);
-}
+constexpr bool isPaddleUseFloat() { return sizeofReal() == sizeof(float); }
 
 }  //  namespace version
 

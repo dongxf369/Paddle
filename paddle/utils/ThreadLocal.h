@@ -1,4 +1,4 @@
-/* Copyright (c) 2016 Baidu, Inc. All Rights Reserve.
+/* Copyright (c) 2016 PaddlePaddle Authors. All Rights Reserve.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -12,17 +12,17 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
 
-
 #pragma once
 
 #include <pthread.h>
-#include <sys/types.h>
 #include <sys/syscall.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include <map>
 #include <mutex>
 #include <random>
 #include "Logging.h"
+#include "Util.h"
 
 namespace paddle {
 
@@ -51,7 +51,7 @@ template <class T>
 class ThreadLocal {
 public:
   ThreadLocal() {
-    PCHECK(pthread_key_create(&threadSpecificKey_, dataDestructor) == 0);
+    CHECK_EQ(pthread_key_create(&threadSpecificKey_, dataDestructor), 0);
   }
   ~ThreadLocal() { pthread_key_delete(threadSpecificKey_); }
 
@@ -65,7 +65,7 @@ public:
     if (!p && createLocal) {
       p = new T();
       int ret = pthread_setspecific(threadSpecificKey_, p);
-      PCHECK(ret == 0);
+      CHECK_EQ(ret, 0);
     }
     return p;
   }
@@ -79,7 +79,7 @@ public:
     if (T* q = get(false)) {
       dataDestructor(q);
     }
-    PCHECK(pthread_setspecific(threadSpecificKey_, p) == 0);
+    CHECK_EQ(pthread_setspecific(threadSpecificKey_, p), 0);
   }
 
   /**
@@ -90,9 +90,7 @@ public:
   /**
    * Implicit conversion to T*
    */
-  operator T*() {
-    return get();
-  }
+  operator T*() { return get(); }
 
 private:
   static void dataDestructor(void* p) { delete (T*)p; }
@@ -114,7 +112,7 @@ private:
 template <class T>
 class ThreadLocalD {
 public:
-  ThreadLocalD() { PCHECK(pthread_key_create(&threadSpecificKey_, NULL) == 0); }
+  ThreadLocalD() { CHECK_EQ(pthread_key_create(&threadSpecificKey_, NULL), 0); }
   ~ThreadLocalD() {
     pthread_key_delete(threadSpecificKey_);
     for (auto t : threadMap_) {
@@ -129,7 +127,7 @@ public:
     T* p = (T*)pthread_getspecific(threadSpecificKey_);
     if (!p) {
       p = new T();
-      PCHECK(pthread_setspecific(threadSpecificKey_, p) == 0);
+      CHECK_EQ(pthread_setspecific(threadSpecificKey_, p), 0);
       updateMap(p);
     }
     return p;
@@ -143,7 +141,7 @@ public:
     if (T* q = (T*)pthread_getspecific(threadSpecificKey_)) {
       dataDestructor(q);
     }
-    PCHECK(pthread_setspecific(threadSpecificKey_, p) == 0);
+    CHECK_EQ(pthread_setspecific(threadSpecificKey_, p), 0);
     updateMap(p);
   }
 
@@ -156,7 +154,8 @@ private:
   static void dataDestructor(void* p) { delete (T*)p; }
 
   void updateMap(T* p) {
-    pid_t tid = syscall(SYS_gettid);
+    pid_t tid = getTID();
+    CHECK_NE(tid, -1);
     std::lock_guard<std::mutex> guard(mutex_);
     auto ret = threadMap_.insert(std::make_pair(tid, p));
     if (!ret.second) {

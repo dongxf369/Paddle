@@ -1,4 +1,4 @@
-/* Copyright (c) 2016 Baidu, Inc. All Rights Reserve.
+/* Copyright (c) 2016 PaddlePaddle Authors. All Rights Reserve.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -12,14 +12,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
 
-
 #include "paddle/utils/Util.h"
 
-#include <stdio.h>
-#include <sys/types.h>
-#include <sys/socket.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <stdio.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 
 #include <thread>
 
@@ -114,7 +113,7 @@ void SocketServer::run() {
 
   /* First call to socket() function */
   socket_ = socket(AF_INET, SOCK_STREAM, 0);
-  PCHECK(socket_ >= 0) << "ERROR opening socket";
+  CHECK(socket_ >= 0) << "ERROR opening socket";
 
   /* Initialize socket structure */
   bzero((char*)&serv_addr, sizeof(serv_addr));
@@ -123,7 +122,7 @@ void SocketServer::run() {
   serv_addr.sin_port = htons(port_);
 
   /* Now bind the host address using bind() call.*/
-  PCHECK(bind(socket_, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) >= 0)
+  CHECK(bind(socket_, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) >= 0)
       << "ERROR on binding";
 
   /* Now start listening for the clients, here process will
@@ -135,7 +134,7 @@ void SocketServer::run() {
   while (true) {
     /* Accept actual connection from the client */
     newsockfd = accept(socket_, (struct sockaddr*)&cli_addr, &clilen);
-    PCHECK(newsockfd >= 0) << "ERROR on accept";
+    CHECK(newsockfd >= 0) << "ERROR on accept";
 
     SocketWorker* worker = new SocketWorker(newsockfd);
     worker->start();
@@ -147,17 +146,17 @@ void SocketWorker::run() {
 
   while (true) {
     int64_t n = channel_.readAll(&header, sizeof(header));
-    PCHECK(n == sizeof(header)) << "ERROR reading from socket";
+    CHECK(n == sizeof(header)) << "ERROR reading from socket";
 
     buffer_.resize(header.dataLength);
     n = channel_.readAll(&buffer_[0], header.dataLength);
-    PCHECK(n == header.dataLength) << "ERROR reading from socket";
+    CHECK(n == header.dataLength) << "ERROR reading from socket";
 
     /* Write a response to the client */
     n = channel_.writeAll(&header, sizeof(header));
-    PCHECK(n == sizeof(header)) << "ERROR reading from socket";
+    CHECK(n == sizeof(header)) << "ERROR reading from socket";
     n = channel_.writeAll(buffer_.data(), buffer_.size());
-    PCHECK(n == header.dataLength) << "ERROR writing to socket";
+    CHECK(n == header.dataLength) << "ERROR writing to socket";
   }
 }
 
@@ -178,26 +177,27 @@ SocketClient::SocketClient(const std::string& serverAddr, int serverPort) {
 
   /* Create a socket point */
   int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-  PCHECK(sockfd >= 0) << "ERROR opening socket";
+  CHECK(sockfd >= 0) << "ERROR opening socket";
   server = gethostbyname(serverAddr.c_str());
-  PCHECK(server) << "ERROR, no such host: " << serverAddr;
+  CHECK(server) << "ERROR, no such host: " << serverAddr;
 
   bzero((char*)&serv_addr, sizeof(serv_addr));
   serv_addr.sin_family = AF_INET;
-  bcopy((char*)server->h_addr, (char*)&serv_addr.sin_addr.s_addr,
+  bcopy((char*)server->h_addr,
+        (char*)&serv_addr.sin_addr.s_addr,
         server->h_length);
   serv_addr.sin_port = htons(serverPort);
 
   /* Now connect to the server */
-  PCHECK(connect(sockfd, (sockaddr*)&serv_addr, sizeof(serv_addr)) >= 0)
+  CHECK(connect(sockfd, (sockaddr*)&serv_addr, sizeof(serv_addr)) >= 0)
       << "ERROR connecting";
 
   channel_.reset(new SocketChannel(sockfd));
 }
 
-P_DEFINE_string(server_addr, "127.0.0.1", "Server address");
-P_DEFINE_int64(dim, 10000000, "Data size");
-P_DEFINE_int32(loop_time, 100000, "test loop time");
+DEFINE_string(server_addr, "127.0.0.1", "Server address");
+DEFINE_int64(dim, 10000000, "Data size");
+DEFINE_int32(loop_time, 100000, "test loop time");
 
 using namespace paddle;  // NOLINT
 
@@ -215,7 +215,7 @@ int main(int argc, char** argv) {
 
   uint64_t dataSize = FLAGS_dim * sizeof(real);
 
-#ifndef PADDLE_ONLY_CPU
+#ifdef PADDLE_WITH_CUDA
   GpuVector gpuParam(FLAGS_dim);
   GpuVector gpuGrad(FLAGS_dim);
 #else
@@ -234,18 +234,18 @@ int main(int argc, char** argv) {
     cpuGrad.copyFrom(gpuGrad);
 
     header.dataLength = dataSize;
-    PCHECK(channel->writeAll(&header, sizeof(header)) == sizeof(header))
+    CHECK(channel->writeAll(&header, sizeof(header)) == sizeof(header))
         << "Client write header error";
 
-    PCHECK(channel->writeAll(cpuGrad.getData(), dataSize) == dataSize)
+    CHECK(channel->writeAll(cpuGrad.getData(), dataSize) == dataSize)
         << "Client write data error";
 
     /* Now read server response */
-    PCHECK(channel->readAll(&header, sizeof(header)) == sizeof(header))
+    CHECK(channel->readAll(&header, sizeof(header)) == sizeof(header))
         << "Client read header error";
 
     CHECK_EQ((uint64_t)header.dataLength, dataSize);
-    PCHECK(channel->readAll(cpuParam.getData(), dataSize) == dataSize)
+    CHECK(channel->readAll(cpuParam.getData(), dataSize) == dataSize)
         << "Client read data error";
 
     gpuParam.copyFrom(cpuParam);

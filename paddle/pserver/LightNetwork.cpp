@@ -1,4 +1,4 @@
-/* Copyright (c) 2016 Baidu, Inc. All Rights Reserve.
+/* Copyright (c) 2016 PaddlePaddle Authors. All Rights Reserve.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -12,40 +12,47 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
 
-
-#include <sys/types.h>
-#include <sys/socket.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <fcntl.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <chrono>
 
 #include <arpa/inet.h>
-#include <sys/ioctl.h>
 #include <net/if.h>
-#include <net/if_arp.h>
+#include <sys/ioctl.h>
 #include <sstream>
-#include <linux/tcp.h>
 
 #include "LightNetwork.h"
-#include "paddle/utils/Util.h"
-#include "paddle/utils/StringUtil.h"
 #include "RDMANetwork.h"
+#include "paddle/utils/StringUtil.h"
+#include "paddle/utils/Util.h"
 
 /// quick ack can reduce the latency of small message
-P_DEFINE_bool(small_messages, false,
-              "if message size is small, recommend set it True to enable quick "
-              "ack and no delay");
+DEFINE_bool(small_messages,
+            false,
+            "if message size is small, recommend set it True to enable quick "
+            "ack and no delay");
 
 /// reasonable sock_send_buf_size can control the traffic injected into switch
 /// network. Injecting too many data into traffic could cause packets loss which
 /// cause long latency and degrade the efficiency of communication.
-P_DEFINE_int32(sock_send_buf_size, 1024 * 1024 * 40,
-               "restrict sock send buff size, can reduce network congestion if "
-               "set carefully");
+DEFINE_int32(sock_send_buf_size,
+             1024 * 1024 * 40,
+             "restrict sock send buff size, can reduce network congestion if "
+             "set carefully");
 
 /// reasonable size can hold bursted packets and reduce packets loss
-P_DEFINE_int32(sock_recv_buf_size, 1024 * 1024 * 40,
-               "restrict sock recv buff size");
+DEFINE_int32(sock_recv_buf_size,
+             1024 * 1024 * 40,
+             "restrict sock recv buff size");
+
+/// reasonable sock_listen_queue_size can control maximum pending connections.
+DEFINE_int32(sock_listen_queue_size,
+             1024,
+             "listen queue size when pserver listen a TCP port");
 
 namespace paddle {
 
@@ -79,6 +86,7 @@ std::string getIpAddr(std::string &device) {
  * @note adjust some default sock option for better performance
  */
 void setOption(int sockfd) {
+#if !defined(__APPLE__) && !defined(__OSX__)
   int sendSize = FLAGS_sock_send_buf_size;
   int recvSize = FLAGS_sock_recv_buf_size;
   CHECK_GE(
@@ -87,15 +95,19 @@ void setOption(int sockfd) {
   CHECK_GE(
       setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sendSize, sizeof(sendSize)),
       0);
+#endif
+
   if (FLAGS_small_messages) {
     int optval = 1;
     CHECK_GE(
         setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &optval, sizeof(optval)),
         0);
+#ifdef TCP_QUICKACK
     optval = 1;
     CHECK_GE(
         setsockopt(sockfd, IPPROTO_TCP, TCP_QUICKACK, &optval, sizeof(optval)),
         0);
+#endif
   }
   int reuse = 1;
   CHECK_GE(setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)),
@@ -122,7 +134,7 @@ SocketServer::SocketServer(const std::string &addr, int port, int rdmaCpu)
   if (rdmaCpu == -1) {
     tcpRdma_ = F_TCP;
     socket_ = 0;
-    maxPendingConnections_ = 100;
+    maxPendingConnections_ = FLAGS_sock_listen_queue_size;
   } else {
     tcpRdma_ = F_RDMA;
     rdmaCpu_ = rdmaCpu;
@@ -134,7 +146,7 @@ SocketServer::SocketServer(const std::string &addr, int port, int rdmaCpu)
   }
 
   /// trigger to initialize RDMA lib
-  PCHECK(RdmaClientDaemons::get()) << "initilizate RDMA failed\n";
+  CHECK(RdmaClientDaemons::get()) << "initilizate RDMA failed\n";
 }
 
 SocketServer::~SocketServer() {
@@ -160,7 +172,7 @@ void SocketServer::tcpServer() {
 
   /// First call to socket() function
   socket_ = socket(AF_INET, SOCK_STREAM, 0);
-  PCHECK(socket_ >= 0) << "ERROR opening socket";
+  CHECK(socket_ >= 0) << "ERROR opening socket";
 
   /// Initialize socket structure
   bzero((char *)&serv_addr, sizeof(serv_addr));
@@ -168,8 +180,9 @@ void SocketServer::tcpServer() {
   serv_addr.sin_port = htons(port_);
   if (!addr_.empty()) {
     server = gethostbyname(addr_.c_str());
-    PCHECK(server) << "ERROR, no such host: " << addr_;
-    bcopy((char *)server->h_addr, (char *)&serv_addr.sin_addr.s_addr,
+    CHECK(server) << "ERROR, no such host: " << addr_;
+    bcopy((char *)server->h_addr,
+          (char *)&serv_addr.sin_addr.s_addr,
           server->h_length);
   } else {
     serv_addr.sin_addr.s_addr = INADDR_ANY;
@@ -178,7 +191,7 @@ void SocketServer::tcpServer() {
   setOption(socket_);
 
   /// Now bind the host address using bind() call.
-  PCHECK(bind(socket_, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) >= 0)
+  CHECK(bind(socket_, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) >= 0)
       << "ERROR on binding " << addr_;
 
   /// Now start listening for the clients, here process will
@@ -192,7 +205,7 @@ void SocketServer::tcpServer() {
     if (stopping_) {
       break;
     }
-    PCHECK(newsockfd >= 0) << "ERROR on accept";
+    CHECK(newsockfd >= 0) << "ERROR on accept";
     constexpr int kPeerNameLen = 128;
     char peerName[kPeerNameLen];
     CHECK(inet_ntop(AF_INET, &cli_addr.sin_addr, peerName, kPeerNameLen));
@@ -218,14 +231,14 @@ void SocketServer::rdmaServer() {
 
   /// First call to socket() function
   rdmaSocket_ = rdma::ssocket(rdmaCpu_);
-  PCHECK(rdmaSocket_) << "ERROR opening RDMA socket";
+  CHECK(rdmaSocket_) << "ERROR opening RDMA socket";
 
-  PCHECK(rdma::bind(rdmaSocket_, rdmaUri_.c_str()) == 0)
+  CHECK(rdma::bind(rdmaSocket_, rdmaUri_.c_str()) == 0)
       << "ERROR bind RDMA socket";
 
   /// Now start listening for the clients, here process will
   /// go in sleep mode and will wait for the incoming connection
-  PCHECK(rdma::listen(rdmaSocket_) == 0) << "ERROR listen RDMA socket";
+  CHECK(rdma::listen(rdmaSocket_) == 0) << "ERROR listen RDMA socket";
 
   while (true) {
     /// Accept actual connection from the client
@@ -233,7 +246,7 @@ void SocketServer::rdmaServer() {
     if (stopping_) {
       break;
     }
-    PCHECK(newsock) << "ERROR on accept";
+    CHECK(newsock) << "ERROR on accept";
 
     constexpr int kPeerNameLen = 128;
     char peerName[kPeerNameLen];
@@ -281,7 +294,7 @@ RdmaClientDaemons::RdmaClientDaemons() {
     onlineCpus_ = rdma::numCpus();
     for (auto i = 0; i < onlineCpus_; i++) {
       socket = rdma::csocket(i);
-      PCHECK(socket) << "ERROR open client socket daemon";
+      CHECK(socket) << "ERROR open client socket daemon";
 
       rdmaClientSocket_.push_back(socket);
     }
@@ -340,29 +353,57 @@ void SocketWorker::run() {
  */
 void SocketClient::TcpClient(const std::string &serverAddr, int serverPort) {
   struct sockaddr_in serv_addr;
-  struct hostent hostinfo, *server;
-  char buf[1024];  // temp for gethostbyname_r
-  int errRet;      // temp for gethostbyname_r
+  struct hostent *server;
+
+  int errRet;  // temp for gethostbyname_r
 
   /// Create a socket point
   int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-  PCHECK(sockfd >= 0) << "ERROR opening socket";
-  CHECK_EQ(0, gethostbyname_r(serverAddr.c_str(), &hostinfo, buf, sizeof(buf),
-                              &server, &errRet))
+  CHECK(sockfd >= 0) << "ERROR opening socket";
+
+#if defined(__OSX__) || defined(__APPLE__)
+  server = getipnodebyname(serverAddr.c_str(), AF_INET, AI_DEFAULT, &errRet);
+  CHECK_NE(HOST_NOT_FOUND, errRet) << "ERROR, no such host: " << serverAddr
+                                   << " ret = " << errRet;
+  CHECK(server) << "getipnodebyname error!";
+#else
+  struct hostent hostinfo;
+  char buf[1024];  // temp for gethostbyname_r
+  CHECK_EQ(
+      0,
+      gethostbyname_r(
+          serverAddr.c_str(), &hostinfo, buf, sizeof(buf), &server, &errRet))
       << "ERROR, no such host: " << serverAddr << " ret = " << errRet;
-  CHECK(server) << "gethostbyname_r err";
+  CHECK(server) << "gethostbyname_r error!";
+#endif
 
   bzero((char *)&serv_addr, sizeof(serv_addr));
   serv_addr.sin_family = AF_INET;
-  bcopy((char *)server->h_addr, (char *)&serv_addr.sin_addr.s_addr,
+  bcopy((char *)server->h_addr,
+        (char *)&serv_addr.sin_addr.s_addr,
         server->h_length);
   serv_addr.sin_port = htons(serverPort);
 
   setOption(sockfd);
 
   /// Now connect to the server
-  PCHECK(connect(sockfd, (sockaddr *)&serv_addr, sizeof(serv_addr)) >= 0)
-      << "ERROR connecting to " << serverAddr;
+  int retry_count = 0;
+  do {
+    if (connect(sockfd, (sockaddr *)&serv_addr, sizeof(serv_addr)) == 0) {
+      break;
+    }
+
+    if (errno == ECONNREFUSED) {
+      LOG(WARNING) << "connection refused by pserver, try again!";
+      if (retry_count++ >= 7) {
+        LOG(FATAL) << "connection refused by pserver, maybe pserver failed!";
+      }
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+    } else {
+      CHECK(errno != 0) << "ERROR connecting to " << serverAddr << ":"
+                        << serverPort << "errorno: " << errno;
+    }
+  } while (errno == ECONNREFUSED);
 
   channel_.reset(new SocketChannel(sockfd, serverAddr));
   tcpRdma_ = F_TCP;
@@ -389,7 +430,7 @@ void SocketClient::RdmaClient(const std::string &serverAddr, int serverPort) {
 
   /// connect to server with socket daemon
   sock = rdma::connect(socketDaemon_, rdmaUri.c_str());
-  PCHECK(sock) << "ERROR connect to server" << rdmaUri;
+  CHECK(sock) << "ERROR connect to server" << rdmaUri;
 
   std::vector<std::string> seg;
   str::split(rdmaUri, '/', &seg);
@@ -406,7 +447,8 @@ void SocketClient::RdmaClient(const std::string &serverAddr, int serverPort) {
  *
  * @note  responsible for building one connection to specified pserver port
  */
-SocketClient::SocketClient(const std::string &serverAddr, int serverPort,
+SocketClient::SocketClient(const std::string &serverAddr,
+                           int serverPort,
                            enum ChannelType channelType) {
   if (channelType == F_RDMA)
     RdmaClient(serverAddr, serverPort);

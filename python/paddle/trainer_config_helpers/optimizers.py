@@ -1,4 +1,4 @@
-# Copyright (c) 2016 Baidu, Inc. All Rights Reserved
+# Copyright (c) 2016 PaddlePaddle Authors. All Rights Reserved
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,11 +17,12 @@ from paddle.trainer.config_parser import Settings, default_decay_rate, \
 
 from .default_decorators import wrap_param_default
 
-__all__ = ['Optimizer', 'BaseSGDOptimizer', 'MomentumOptimizer',
-           'AdamaxOptimizer', 'AdamOptimizer', 'AdaGradOptimizer',
-           'RMSPropOptimizer', 'DecayedAdaGradOptimizer',
-           'AdaDeltaOptimizer', 'BaseRegularization', 'L2Regularization',
-           'settings', 'ModelAverage']
+__all__ = [
+    'Optimizer', 'BaseSGDOptimizer', 'MomentumOptimizer', 'AdamaxOptimizer',
+    'AdamOptimizer', 'AdaGradOptimizer', 'RMSPropOptimizer',
+    'DecayedAdaGradOptimizer', 'AdaDeltaOptimizer', 'BaseRegularization',
+    'L2Regularization', 'settings', 'ModelAverage'
+]
 
 
 class Optimizer(object):
@@ -64,14 +65,6 @@ class BaseSGDOptimizer(Optimizer):
         w = w - \\eta \\nabla Q(w) = w - \\eta \\sum_{i}^{n} \\nabla Q_i(w)
 
     where :math:`\\eta` is learning rate. And :math:`n` is batch size.
-
-    The SGD method is implemented by paddle with multiple extensions. Such as
-    momentum, adagrad, rmsprop, adam. Please use method 'use_xxx', such as
-    use_adam, to enhance the SGD method.
-
-    WARNING: IN PADDLE'S IMPLEMENTATION, BATCH_SIZE IS SET FOR ONE COMPUTE
-    PROCESS(NODE). IF YOU USE MULTIPLE MACHINE TO TRAIN YOUR NETWORK, THE GLOBAL
-    BATCH SIZE WILL BE (BATCH_SIZE * MACHINE_COUNT).
     """
 
     def to_setting_kwargs(self):
@@ -79,16 +72,38 @@ class BaseSGDOptimizer(Optimizer):
 
 
 class MomentumOptimizer(BaseSGDOptimizer):
+    """
+    MomentumOptimizer.
+
+    When sparse=True, the update scheme:
+
+    ..  math::
+
+        \\alpha_t &= \\alpha_{t-1} / k \\\\
+        \\beta_t &= \\beta_{t-1} / (1 + \\lambda \\gamma_t) \\\\
+        u_t &= u_{t-1} - \\alpha_t \\gamma_t g_t \\\\
+        v_t &= v_{t-1} + \\tau_{t-1} \\alpha_t \\gamma_t g_t \\\\
+        \\tau_t &= \\tau_{t-1} + \\beta_t / \\alpha_t
+    
+    where :math:`k` is momentum, :math:`\\lambda` is decay rate, 
+    :math:`\\gamma_t` is learning rate at the t'th step.
+
+    :param sparse: with sparse support or not.
+    :type sparse: bool
+    """
+
     def extra_settings(self):
         default_momentum(self.momentum)
 
     def to_setting_kwargs(self):
-        return {
-            'learning_method': 'momentum'
-        }
+        if self.sparse:
+            return {'learning_method': 'sparse_momentum'}
+        else:
+            return {'learning_method': 'momentum'}
 
-    def __init__(self, momentum=1e-3):
+    def __init__(self, momentum=None, sparse=False):
         self.momentum = momentum
+        self.sparse = sparse
 
 
 class AdamOptimizer(BaseSGDOptimizer):
@@ -101,7 +116,7 @@ class AdamOptimizer(BaseSGDOptimizer):
 
         m(w, t) & = \\beta_1 m(w, t-1) + (1 - \\beta_1) \\nabla Q_i(w) \\\\
         v(w, t) & = \\beta_2 v(w, t-1) + (1 - \\beta_2)(\\nabla Q_i(w)) ^2 \\\\
-        w & = w - \\frac{\\eta}{\\sqrt{v(w,t) + \\epsilon}}
+        w & = w - \\frac{\\eta m(w, t)}{\\sqrt{v(w,t) + \\epsilon}}
 
     :param beta1: the :math:`\\beta_1` in equation.
     :type beta1: float
@@ -180,9 +195,7 @@ class AdaGradOptimizer(BaseSGDOptimizer):
     """
 
     def to_setting_kwargs(self):
-        return {
-            'learning_method': 'adagrad'
-        }
+        return {'learning_method': 'adagrad'}
 
     def __init__(self):
         pass
@@ -294,9 +307,7 @@ class L2Regularization(BaseRegularization):
 
     def to_setting_kwargs(self):
         if self.algorithm == 'owlqn':
-            return {
-                'l2weight': self.decay_rate
-            }
+            return {'l2weight': self.decay_rate}
         else:
             return dict()
 
@@ -313,7 +324,8 @@ class ModelAverage(Optimizer):
             'do_average_in_cpu': self.do_average_in_cpu
         }
 
-    def __init__(self, average_window,
+    def __init__(self,
+                 average_window,
                  max_average_window=None,
                  do_average_in_cpu=False):
         self.average_window = average_window
@@ -339,30 +351,51 @@ def __extends__(dict1, dict2):
     return dict1
 
 
-@wrap_param_default(['learning_method'],
-                    default_factory=lambda _: MomentumOptimizer())
-@wrap_param_default(['regularization'],
-                    default_factory=lambda _: BaseRegularization())
+@wrap_param_default(
+    ['learning_method'], default_factory=lambda _: MomentumOptimizer())
+@wrap_param_default(
+    ['regularization'], default_factory=lambda _: BaseRegularization())
 def settings(batch_size,
              learning_rate=1e-3,
+             learning_rate_decay_a=0.,
+             learning_rate_decay_b=0.,
+             learning_rate_schedule='poly',
+             learning_rate_args='',
              learning_method=None,
              regularization=None,
              is_async=False,
              model_average=None,
-             gradient_clipping_threshold=None
-             ):
+             gradient_clipping_threshold=None):
     """
-    TODO(yuyang18): Complete docs.
+    Set the optimization method, learning rate, batch size, and other training
+    settings. The currently supported algorithms are SGD and Async-SGD.
 
+    ..  warning::
 
-    :param batch_size:
-    :param learning_rate:
-    :param learning_method:
-    :param regularization:
-    :param is_async:
-    :param model_average:
-    :param gradient_clipping_threshold:
-    :return:
+        Note that the 'batch_size' in PaddlePaddle is not equal to global
+        training batch size. It represents the single training process's batch
+        size. If you use N processes to train one model, for example use three
+        GPU machines, the global batch size is N*'batch_size'.
+
+    :param batch_size: batch size for one training process.
+    :type batch_size: int
+    :param learning_rate: learning rate for SGD
+    :type learning_rate: float
+    :param learning_method: The extension optimization algorithms of gradient
+                            descent, such as momentum, adagrad, rmsprop, etc.
+                            Note that it should be instance with base type
+                            BaseSGDOptimizer.
+    :type learning_method: BaseSGDOptimizer
+    :param regularization: The regularization method.
+    :type regularization: BaseRegularization
+    :param is_async: Is Async-SGD or not. Default value is False.
+    :type is_async: bool
+    :param model_average: Model Average Settings.
+    :type model_average: ModelAverage
+    :param gradient_clipping_threshold: gradient clipping threshold. If gradient
+                                        value larger than some value, will be
+                                        clipped.
+    :type gradient_clipping_threshold: float
     """
     if isinstance(regularization, BaseRegularization):
         regularization = [regularization]
@@ -373,10 +406,15 @@ def settings(batch_size,
     else:
         algorithm = 'owlqn'
 
+    args = [
+        'batch_size', 'learning_rate', 'learning_rate_decay_a',
+        'learning_rate_decay_b', 'learning_rate_schedule', 'learning_rate_args',
+        'gradient_clipping_threshold'
+    ]
     kwargs = dict()
-    kwargs['batch_size'] = batch_size
-    kwargs['learning_rate'] = learning_rate
     kwargs['algorithm'] = algorithm
+    for arg in args:
+        kwargs[arg] = locals()[arg]
 
     kwargs = __extends__(kwargs, learning_method.to_setting_kwargs())
     learning_method.extra_settings()

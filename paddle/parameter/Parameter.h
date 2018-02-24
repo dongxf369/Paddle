@@ -1,4 +1,4 @@
-/* Copyright (c) 2016 Baidu, Inc. All Rights Reserve.
+/* Copyright (c) 2016 PaddlePaddle Authors. All Rights Reserve.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -12,7 +12,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
 
-
 #pragma once
 
 #include <stdint.h>
@@ -24,34 +23,36 @@ limitations under the License. */
 #include "ParameterConfig.pb.h"
 #include "TrainerConfig.pb.h"
 
-#include "paddle/utils/Locks.h"
-#include "paddle/utils/TypeDefs.h"
-#include "paddle/math/Vector.h"
-#include "paddle/math/Matrix.h"
-#include "paddle/utils/Util.h"
-#include "paddle/utils/ThreadLocal.h"
 #include "ParameterUpdaterHook.h"
+#include "paddle/math/Matrix.h"
+#include "paddle/math/Vector.h"
+#include "paddle/utils/Common.h"
 #include "paddle/utils/GlobalConstants.h"
+#include "paddle/utils/Locks.h"
+#include "paddle/utils/ThreadLocal.h"
+#include "paddle/utils/Util.h"
 
 namespace paddle {
+
+typedef enum {
+  /// The paddle original basic format
+  PARAM_FORMAT_ORIGINAL = 0,
+
+  /// See mkldnn_memory_format_t in
+  /// https://github.com/01org/mkl-dnn/blob/master/include/mkldnn_types.h
+  /// for a detailed description.
+  /// 2D weights tensor in the format (output channels, input channels).
+  PARAM_FORMAT_MKLDNN_OI,
+
+  /// The total format items numbers
+  PARAM_FORMAT_ITEMS,
+} PARAM_FORMAT;
 
 class SparsePrefetchRowCpuMatrix;
 
 class Parameter;
 typedef std::function<void(Parameter* param)> UpdateCallback;
 typedef std::function<void(int paramId, Parameter* param)> ParamInitCallback;
-
-struct Segment {
-  int64_t beginDim;
-  int64_t endDim;
-
-  // We allow the possibility that the parameters are not stored at contiguous
-  // memory locations for speed reason (i.e. data alignemnt)
-  // This means that the dimenstion is not same as the position in the memroy
-  // buffer.
-  int64_t beginPos;  // beginning position in the local value or grad buffer
-};
-
 
 class Parameter;
 typedef std::shared_ptr<Parameter> ParameterPtr;
@@ -64,7 +65,10 @@ public:
   size_t getSize() const { return config_.size(); }
 
   bool isFullSize() const {
-    return this->getSize() == bufs_[PARAMETER_VALUE]->getSize();
+    if (bufs_[PARAMETER_VALUE]) {
+      return this->getSize() == bufs_[PARAMETER_VALUE]->getSize();
+    }
+    return false;
   }
 
   inline bool useGpu() const { return useGpu_; }
@@ -129,8 +133,7 @@ public:
     if (config_.dims_size() == 2) {
       if (matType == MAT_NORMAL || matType == MAT_NORMAL_SHARED ||
           matType == MAT_SPARSE_ROW_PREFETCH_FULL_SIZE ||
-          matType == MAT_VALUE_SHARED ||
-          matType == MAT_SPARSE_ROW_IDS) {
+          matType == MAT_VALUE_SHARED || matType == MAT_SPARSE_ROW_IDS) {
         bufs_[type] = Vector::createParallelVector(config_.size(), useGpu_);
         bufs_[type]->zeroMem();
       } else {
@@ -146,6 +149,12 @@ public:
     }
   }
 
+  void enableBufType(ParameterType type) {
+    if (bufs_[type]) return;
+    bufs_[type] = Vector::createParallelVector(config_.size(), useGpu_);
+    bufs_[type]->zeroMem();
+  }
+
   void enableIntType(ParameterType type, size_t intStoreSize = 0) {
     if (!intBufs_[type]) {
       SetDevice device(deviceId_);
@@ -155,18 +164,12 @@ public:
     }
   }
 
-  void enableSharedType(ParameterType type, VectorPtr vec,
+  void enableSharedType(ParameterType type,
+                        VectorPtr vec,
                         MatrixPtr mat = nullptr) {
     if (!bufs_[type] && !mats_[type]) {
       bufs_[type] = vec;
       mats_[type] = mat;
-    }
-  }
-
-  void enableSharedType(ParameterType type, VectorPtr vec, MatType matType) {
-    if (!bufs_[type]) {
-      bufs_[type] = vec;
-      setMat(type, matType);
     }
   }
 
@@ -199,44 +202,11 @@ public:
 
   const MatrixPtr& getMat(ParameterType pType) const { return mats_[pType]; }
 
-  const IVectorPtr& getIntBuf(ParameterType pType) { return intBufs_[pType]; }
-
-  void setIntBuf(ParameterType pType, const IVectorPtr& iVec) {
-    intBufs_[pType] = iVec;
-  }
-
-  SparsePrefetchRowCpuMatrix* getPrefetchMatrix();
-
-  float getLearnRate() const { return config_.learning_rate(); }
-
-  float getInitMean() const { return config_.initial_mean(); }
-
-  float getInitStandardDeviation() const { return config_.initial_std(); }
-
   void setValueUpdated() { updated_ = true; }
 
   void clearValueUpdated() { updated_ = false; }
 
   bool isValueUpdated() const { return updated_; }
-
-  /**
-   * Update bufs_[PARAMETER_VALUE] using bufs_[PARAMETER_GRADIENT]
-   */
-  void updateWithGradient(real learningRate);
-
-  /**
-   * Update bufs_[PARAMETER_VALUE] using sparse row grad matrix.
-   *
-   * @see SparseRowCpuMatrix::sgdUpdate for more information.
-   */
-  void updateWithGradient(real learningRate, MatrixPtr gradMat, IVectorPtr t0,
-                          int currentTime, bool fini = false);
-
-  /**
-   * This function is used to calculate multiple gpus, but only as a candidate
-   */
-  void updateWithGradient(real learningRate, VectorPtr grad,
-                          bool normalUpdate = true);
 
   /**
    * Save parameter value to a file
@@ -257,8 +227,6 @@ public:
    * Load parameter from istream
    */
   bool load(std::istream& is);
-
-  std::vector<Segment>& getGradientSegments() { return gradSegments_; }
 
   void incShared() { sharedCount_++; }
 
@@ -291,13 +259,33 @@ public:
   /// Initialize the value to 0
   void zeroMem();
 
-  static const int kFormatVersion = 0;
   /// file header structure
   struct Header {
-    int32_t version;     // = 0, file format version
+    int32_t format;      // = PARAM_FORMAT
     uint32_t valueSize;  // = sizeof(real)
     uint64_t size;       // = getSize()
   };
+
+  /**
+   * @brief Is the header format supported.
+   */
+  static bool isHeaderFormatSupported(int32_t fmt) {
+    return fmt < PARAM_FORMAT_ITEMS;
+  }
+
+  /**
+   * @brief Get the format in header.
+   */
+  int getHeaderFormat() { return headerFormat_; }
+
+  /**
+   * @brief Set the format in header.
+   */
+  void setHeaderFormat(int32_t fmt) {
+    CHECK(isHeaderFormatSupported(fmt)) << "Unsupported format version: "
+                                        << fmt;
+    headerFormat_ = fmt;
+  }
 
   /**
    * @brief  Parameter Update Hook.
@@ -366,12 +354,12 @@ protected:
 
   int sharedCount_;
   int updateCounter_;
-  std::vector<Segment> gradSegments_;  // segments of non-zero gradient
 
   bool updated_;
   SparseFormat format_;
 
-  static ThreadLocal<std::vector<VectorPtr>> tlsTempBufs_;
+  /// The header format for saving or loading param
+  int32_t headerFormat_;
 
   std::vector<std::shared_ptr<IParameterUpdaterHook>> updaterHooks_;
 
@@ -379,22 +367,12 @@ public:
   void setSharedCount(int cnt) { sharedCount_ = cnt; }
   int getSharedCount() { return sharedCount_; }
 
-  void singleUpdate(void* data);
   bool isSparse() { return config_.is_sparse(); }
   SparseFormat getFormat() { return format_; }
 
   static const std::string kMissParameterFail;
   static const std::string kMissParameterRand;
   static const std::string kMissParameterZero;
-
-  static VectorPtr* getTlsTempBufs();
-
-  /**
-   * exec a func in single/multi thread.
-   * vecs is bufs_ of Parameter, as input of ExecFunc.
-   */
-  typedef std::function<void(const VectorPtr vecs[])> ExecFunc;
-  void exec(ExecFunc func);
 };
 
 typedef std::map<std::string, ParameterPtr> ParameterMap;

@@ -1,4 +1,4 @@
-/* Copyright (c) 2016 Baidu, Inc. All Rights Reserve.
+/* Copyright (c) 2016 PaddlePaddle Authors. All Rights Reserve.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -12,7 +12,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
 
-
 #pragma once
 
 #include "Layer.h"
@@ -22,18 +21,18 @@ limitations under the License. */
 namespace paddle {
 
 /**
- * A layer for data normalization
- * Input: One and only one input layer is accepted. The input layer must
+ * @brief A layer for data normalization
+ * - Input: One and only one input layer is accepted. The input layer must
  *        be DataLayer with dense data type.
- * Output: The normalization of the input data
+ * - Output: The normalization of the input data
  *
  * Reference:
  *    LA Shalabi, Z Shaaban, B Kasasbeh. Data mining: A preprocessing engine
  *
  * Three data normalization methoeds are considered
- *    z-score: y = (x-mean)/std
- *    min-max: y = (x-min)/(max-min)
- *    decimal-scaling: y = x/10^j, where j is the smallest integer such that
+ * - z-score: y = (x-mean)/std
+ * - min-max: y = (x-min)/(max-min)
+ * - decimal-scaling: y = x/10^j, where j is the smallest integer such that
  *max(|y|)<1
  */
 
@@ -45,10 +44,11 @@ public:
 
   ~DataNormLayer() {}
 
-  bool init(const LayerMap& layerMap, const ParameterMap& parameterMap);
+  bool init(const LayerMap& layerMap,
+            const ParameterMap& parameterMap) override;
 
-  void forward(PassType passType);
-  void backward(const UpdateCallback& callback = nullptr);
+  void forward(PassType passType) override;
+  void backward(const UpdateCallback& callback = nullptr) override;
 
 protected:
   int mode_;

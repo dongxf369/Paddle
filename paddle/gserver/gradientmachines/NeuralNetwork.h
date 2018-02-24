@@ -1,4 +1,4 @@
-/* Copyright (c) 2016 Baidu, Inc. All Rights Reserve.
+/* Copyright (c) 2016 PaddlePaddle Authors. All Rights Reserve.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -12,21 +12,20 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
 
-
 #pragma once
 
-#include <memory>
-#include <map>
 #include <functional>
+#include <map>
+#include <memory>
 
-#include "paddle/utils/ClassRegistrar.h"
-#include "paddle/parameter/Parameter.h"
 #include "ModelConfig.pb.h"
+#include "paddle/gserver/dataproviders/DataProvider.h"
 #include "paddle/gserver/gradientmachines/GradientMachine.h"
 #include "paddle/gserver/layers/CostLayer.h"
 #include "paddle/gserver/layers/DataLayer.h"
-#include "paddle/gserver/dataproviders/DataProvider.h"
 #include "paddle/gserver/layers/Layer.h"
+#include "paddle/parameter/Parameter.h"
+#include "paddle/utils/ClassRegistrar.h"
 
 namespace paddle {
 /*
@@ -52,19 +51,19 @@ namespace paddle {
  * GPU value: NORMAL
  * GPU param: NORMAL
  */
-void parameterInitNN(int paramId, Parameter* para,
+void parameterInitNN(int paramId,
+                     Parameter* para,
                      std::vector<ParameterPtr>* sharedParams);
-
 
 class NeuralNetwork : public GradientMachine {
 public:
-  virtual void init(
-      const ModelConfig& config, ParamInitCallback callback = nullptr,
-      const std::vector<ParameterType>&
-          parameterTypes = std::vector<ParameterType>{PARAMETER_VALUE,
-                                                      PARAMETER_GRADIENT,
-                                                      PARAMETER_MOMENTUM},
-      bool useGpu = FLAGS_use_gpu);
+  virtual void init(const ModelConfig& config,
+                    ParamInitCallback callback = nullptr,
+                    const std::vector<ParameterType>& parameterTypes =
+                        std::vector<ParameterType>{PARAMETER_VALUE,
+                                                   PARAMETER_GRADIENT,
+                                                   PARAMETER_MOMENTUM},
+                    bool useGpu = FLAGS_use_gpu);
 
   /**
    * Connect two submodels and
@@ -76,17 +75,20 @@ public:
    * @param agentLayer The up-submodel's input agent layer.
    */
   static void connect(LayerPtr agentLayer, LayerPtr realLayer, int height = 0);
-  void connect(std::string agentLayerName, NeuralNetwork* srcNN,
+  void connect(std::string agentLayerName,
+               NeuralNetwork* srcNN,
                std::string realLayerName);
 
   virtual void prefetch(const std::vector<Argument>& inArgs);
 
   virtual void forward(const std::vector<Argument>& inArgs,
-                       std::vector<Argument>* outArgs, PassType passType);
+                       std::vector<Argument>* outArgs,
+                       PassType passType);
 
   virtual void backward(const UpdateCallback& callback = nullptr);
 
-  MatrixPtr getLayerOutput(const std::string& layerName);
+  virtual Argument getLayerOutput(const std::string& layerName);
+
   const LayerPtr& getLayer(const std::string& layerName) const {
     auto it = layerMap_.find(layerName);
     CHECK(it != layerMap_.end()) << "Unknown layer " << layerName;
@@ -95,9 +97,12 @@ public:
 
   virtual void onPassEnd();
 
-  virtual Evaluator* makeEvaluator();
+#ifndef PADDLE_MOBILE_INFERENCE
+  virtual Evaluator* makeEvaluator() const;
 
-  virtual void eval(Evaluator* evaluator);
+  virtual void eval(Evaluator* evaluator) const;
+#endif
+
   virtual void resetState();
   virtual void setOutputGrad(const std::vector<Argument>& args);
 
@@ -117,16 +122,20 @@ public:
    */
   template <typename T>
   void forEachLayer(T callback) {
-    for (auto & l : layers_) {
+    for (auto& l : layers_) {
       if (callback(l)) {
         break;
       }
     }
   }
 
-
   static NeuralNetwork* newNeuralNetwork(const std::string& name = "",
-                                        NeuralNetwork* rootNetwork = nullptr);
+                                         NeuralNetwork* rootNetwork = nullptr);
+
+  const std::string& getName() const { return subModelName_; }
+
+  /// some finish work, like convert the weight format of MKLDNNLayers
+  void finish();
 
 protected:
   /**
@@ -139,8 +148,7 @@ protected:
    */
   NeuralNetwork(std::string subModelName = "",
                 NeuralNetwork* rootNetwork = nullptr)
-      : subModelName_(subModelName),
-        rootNetwork_(rootNetwork) {}
+      : subModelName_(subModelName), rootNetwork_(rootNetwork) {}
 
   std::string subModelName_;
   ModelConfig config_;

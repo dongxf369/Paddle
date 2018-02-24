@@ -1,4 +1,4 @@
-/* Copyright (c) 2016 Baidu, Inc. All Rights Reserve.
+/* Copyright (c) 2016 PaddlePaddle Authors. All Rights Reserve.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -12,12 +12,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
 
-#ifndef PADDLE_ONLY_CPU
+#ifdef PADDLE_WITH_CUDA
 
-#include "paddle/utils/Util.h"
-#include "paddle/math/Vector.h"
-#include "test_matrixUtil.h"
 #include <gtest/gtest.h>
+#include "paddle/math/Vector.h"
+#include "paddle/utils/Util.h"
+#include "test_matrixUtil.h"
 
 using namespace paddle;  // NOLINT
 
@@ -75,13 +75,6 @@ TEST(CpuGpuVector, subCreate) {
 
   // check v1_gpu_data == v2_gpu_data
   checkDataEqual(v1Check->getData() + offset, v2Check->getData(), size2);
-}
-
-int main(int argc, char** argv) {
-  testing::InitGoogleTest(&argc, argv);
-  initMain(argc, argv);
-  int ret = RUN_ALL_TESTS();
-  return ret;
 }
 
 #endif

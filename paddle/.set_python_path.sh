@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright (c) 2016 Baidu, Inc. All Rights Reserved
+# Copyright (c) 2016 PaddlePaddle Authors. All Rights Reserved
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,7 +21,6 @@
 # 
 # It same as PYTHONPATH=${YOUR_PYTHON_PATH}:$PYTHONPATH {exec...}
 #
-
 PYPATH=""
 set -x
 while getopts "d:" opt; do
@@ -32,5 +31,5 @@ while getopts "d:" opt; do
   esac
 done
 shift $(($OPTIND - 1))
-export PYTHONPATH=$PYPATH
+export PYTHONPATH=$PYPATH:$PYTHONPATH
 $@

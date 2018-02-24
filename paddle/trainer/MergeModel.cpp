@@ -1,4 +1,4 @@
-/* Copyright (c) 2016 Baidu, Inc. All Rights Reserve.
+/* Copyright (c) 2016 PaddlePaddle Authors. All Rights Reserve.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,13 +14,14 @@ limitations under the License. */
 
 #include <memory>
 
-#include "paddle/utils/PythonUtil.h"
-#include "paddle/pserver/ParameterServer2.h"
 #include "ParamUtil.h"
 #include "Trainer.h"
+#include "paddle/pserver/ParameterServer2.h"
+#include "paddle/utils/PythonUtil.h"
 
-P_DEFINE_string(model_dir, "", "Directory for separated model files");
-P_DEFINE_string(model_file, "", "File for merged model file");
+DEFINE_string(model_dir, "", "Directory for separated model files");
+DEFINE_string(config_file, "", "Config file for the model");
+DEFINE_string(model_file, "", "File for merged model file");
 
 using namespace paddle;  // NOLINT
 using namespace std;     // NOLINT
@@ -28,8 +29,16 @@ using namespace std;     // NOLINT
 int main(int argc, char** argv) {
   initMain(argc, argv);
   initPython(argc, argv);
-  string confFile = TrainerConfigHelper::getConfigNameFromPath(FLAGS_model_dir);
-#ifdef PADDLE_ONLY_CPU
+
+  if (FLAGS_model_dir.empty() || FLAGS_config_file.empty() ||
+      FLAGS_model_file.empty()) {
+    LOG(INFO) << "Usage: ./paddle_merge_model --model_dir=pass-00000 "
+                 "--config_file=config.py --model_file=out.paddle";
+    return 0;
+  }
+
+  string confFile = FLAGS_config_file;
+#ifndef PADDLE_WITH_CUDA
   FLAGS_use_gpu = false;
 #endif
   auto config = std::make_shared<TrainerConfigHelper>(confFile);

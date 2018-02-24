@@ -1,4 +1,4 @@
-/* Copyright (c) 2016 Baidu, Inc. All Rights Reserve.
+/* Copyright (c) 2016 PaddlePaddle Authors. All Rights Reserve.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -11,8 +11,6 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
-
-
 
 #pragma once
 #include <stddef.h>
@@ -118,29 +116,43 @@ inline bool vec_check(size_t len) {
 }
 
 namespace internal {
+#ifdef __SSE3__
 void addToImpl(float* a, const float* b, size_t len);
 void batchAddToImpl(float* a, const float* b[], int batch, size_t len);
 void colMaxImpl(float* result, const float* data, int dim, int numSamples);
+#endif
 #ifdef __AVX__
 void decayL1AvxImpl(float* dst, float* src, float lambda, size_t len);
-void decayL1AvxImpl(float* dst, float* src, float* lr, float lambda,
-                    size_t len);
+void decayL1AvxImpl(
+    float* dst, float* src, float* lr, float lambda, size_t len);
 #endif
 }  // namespace internal
 
 template <>
 inline void addTo(float* a, const float* b, size_t len) {
+#ifdef __SSE3__
   internal::addToImpl(a, b, len);
+#else
+  naive::addTo(a, b, len);
+#endif
 }
 
 template <>
 inline void batchAddTo(float* a, const float* b[], int batch, size_t len) {
+#ifdef __SSE3__
   internal::batchAddToImpl(a, b, batch, len);
+#else
+  naive::batchAddTo(a, b, batch, len);
+#endif
 }
 
 template <>
 inline void colMax(float* result, const float* data, int dim, int numSamples) {
+#ifdef __SSE3__
   internal::colMaxImpl(result, data, dim, numSamples);
+#else
+  naive::colMax(result, data, dim, numSamples);
+#endif
 }
 
 template <>
@@ -153,8 +165,8 @@ inline void decayL1(float* dst, float* src, float lambda, size_t len) {
 }
 
 template <>
-inline void decayL1(float* dst, float* src, float* lr, float lambda,
-                    size_t len) {
+inline void decayL1(
+    float* dst, float* src, float* lr, float lambda, size_t len) {
 #ifdef __AVX__
   internal::decayL1AvxImpl(dst, src, lr, lambda, len);
 #else

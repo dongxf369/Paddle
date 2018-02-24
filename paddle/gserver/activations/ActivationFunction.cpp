@@ -1,4 +1,4 @@
-/* Copyright (c) 2016 Baidu, Inc. All Rights Reserve.
+/* Copyright (c) 2016 PaddlePaddle Authors. All Rights Reserve.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,21 +15,33 @@ limitations under the License. */
 #include "ActivationFunction.h"
 
 #include <algorithm>
-#include <memory>
 #include <iostream>
-#include <type_traits>
+#include <memory>
 #include <string>
 #include <thread>
-#include "paddle/utils/ClassRegistrar.h"
+#include <type_traits>
 #include "paddle/parameter/Argument.h"
-
+#include "paddle/utils/ClassRegistrar.h"
 #include "paddle/utils/Logging.h"
+
+#ifdef PADDLE_USE_MKLDNN
+#include "MKLDNNActivation.h"
+#endif
 
 namespace paddle {
 
 static ClassRegistrar<ActivationFunction> gActivationRegistrar;
+/**
+ * @def ACTIVATION_CLASS_NAME
+ * @brief Macro for getting derived activation class name
+ * @note ACTIVATION_CLASS_NAME(softmax) softmax_;
+ * means softmaxActivation softmax_;
+ */
 #define ACTIVATION_CLASS_NAME(ACTIVATION_NAME) ACTIVATION_NAME##Activation
-
+/**
+ * @def BEGIN_DEFINE_ACTIVATION
+ * @brief Macro for defining a devried activation class
+ */
 #define BEGIN_DEFINE_ACTIVATION(ACTIVATION_NAME)                             \
   class ACTIVATION_CLASS_NAME(ACTIVATION_NAME) : public ActivationFunction { \
   private:                                                                   \
@@ -37,14 +49,19 @@ static ClassRegistrar<ActivationFunction> gActivationRegistrar;
                                                                              \
   public:                                                                    \
     const std::string& getName() const { return name; }
-
+/**
+ * @def END_DEFINE_ACTIVATION
+ * @brief Macro for registering a derived activation class
+ */
 #define END_DEFINE_ACTIVATION(ACTIVATION_NAME)                     \
-  };                                                               \
+  }                                                                \
+  ;                                                                \
   const std::string ACTIVATION_CLASS_NAME(ACTIVATION_NAME)::name = \
       #ACTIVATION_NAME;                                            \
   static InitFunction __reg_activation__##ACTIVATION_NAME([] {     \
-    gActivationRegistrar.registerClass<                            \
-        ACTIVATION_CLASS_NAME(ACTIVATION_NAME)>(#ACTIVATION_NAME); \
+    gActivationRegistrar                                           \
+        .registerClass<ACTIVATION_CLASS_NAME(ACTIVATION_NAME)>(    \
+            #ACTIVATION_NAME);                                     \
   });
 
 /**
@@ -55,8 +72,14 @@ static ClassRegistrar<ActivationFunction> gActivationRegistrar;
 class IdentityActivation : public ActivationFunction {
 public:
   static const std::string name;
-  void forward(Argument& act) { (void)act; }
-  void backward(Argument& act) { (void)act; }
+  Error __must_check forward(Argument& act) {
+    (void)act;
+    return Error();
+  }
+  Error __must_check backward(Argument& act) {
+    (void)act;
+    return Error();
+  }
   const std::string& getName() const { return name; }
 };
 const std::string IdentityActivation::name = "";
@@ -66,29 +89,40 @@ static InitFunction __reg_activation__identity([] {
 });
 
 /**
- * SigmoidActivation
- *
+ * @brief Sigmoid Activation
+ * \f[
  * f(z) = \frac{1}{1+exp(-z)}
+ * \f]
  */
 BEGIN_DEFINE_ACTIVATION(sigmoid)
-void forward(Argument& act) { act.value->sigmoid(*act.value); }
-void backward(Argument& act) { act.grad->sigmoidDerivative(*act.value); }
+Error __must_check forward(Argument& act) {
+  act.value->sigmoid(*act.value);
+  return Error();
+}
+Error __must_check backward(Argument& act) {
+  act.grad->sigmoidDerivative(*act.value);
+  return Error();
+}
 END_DEFINE_ACTIVATION(sigmoid)
 
 /**
- * Do Softmax activation for all sample.
+ * @brief Softmax Activation
+ * \f[
  * P(y=j|x) = \frac{e^{x^Tw_j}}{\sum^K_{k=1}e^{x^Tw_k}}
+ * \f]
  */
 BEGIN_DEFINE_ACTIVATION(softmax)
 private:
 MatrixPtr sftMaxSum_;
 MatrixPtr sftMaxDot_;
-MatrixPtr one_;
 
 public:
-void forward(Argument& act) { act.value->softmax(*act.value); }
+Error __must_check forward(Argument& act) {
+  act.value->softmax(*act.value);
+  return Error();
+}
 
-void backward(Argument& act) {
+Error __must_check backward(Argument& act) {
   MatrixPtr outputV = act.value;
   MatrixPtr outputG = act.grad;
 
@@ -96,52 +130,73 @@ void backward(Argument& act) {
     outputG->softmaxBackward(*outputV);
   } else {
     SetDevice device(act.deviceId);
-    Matrix::resizeOrCreate(sftMaxDot_, outputG->getHeight(),
+    Matrix::resizeOrCreate(sftMaxDot_,
+                           outputG->getHeight(),
                            outputG->getWidth(),
-                           /* trans */ false, useGpu(act.deviceId));
-    Matrix::resizeOrCreate(sftMaxSum_, outputG->getHeight(), 1,
-                           /* trans */ false, useGpu(act.deviceId));
-    if (!one_ || one_->getWidth() != outputG->getWidth()) {
-      Matrix::resizeOrCreate(one_, 1, outputG->getWidth(),
-                             /* trans */ false, useGpu(act.deviceId));
-      one_->one();
-    }
+                           /* trans */ false,
+                           useGpu(act.deviceId));
+    Matrix::resizeOrCreate(sftMaxSum_,
+                           outputG->getHeight(),
+                           1,
+                           /* trans */ false,
+                           useGpu(act.deviceId));
 
     sftMaxDot_->dotMul(*outputG, *outputV);
     sftMaxSum_->colMerge(*sftMaxDot_);
 
     act.grad->softmaxDerivative(*act.value, *sftMaxSum_);
   }
+  return Error();
 }
 END_DEFINE_ACTIVATION(softmax)
 
-/// Softmax on all frames of one sequence.
-/// Width of frame must be one.
+/**
+ * @brief Sequence_softmax Activation
+ * @note Softmax on all frames of one sequence.
+ * Width of frame must be one.
+ */
 BEGIN_DEFINE_ACTIVATION(sequence_softmax)
 private:
 ACTIVATION_CLASS_NAME(softmax) softmax_;
 Argument argument_;
 
 public:
-void forward(Argument& act) {
-  CHECK_EQ(act.value->getWidth(), 1UL);
-
-  if (!argument_.value) {
-    argument_.value = Matrix::create(nullptr, /* height= */ 1, 1,
-                                     /* trans= */ false, useGpu(act.deviceId));
-    argument_.grad = Matrix::create(nullptr, /* height= */ 1, 1,
-                                    /* trans= */ false, useGpu(act.deviceId));
+Error __must_check forward(Argument& act) {
+  if (act.value->getWidth() != 1UL) {
+    return Error(
+        "Input width for each timestep of sequence softmax should be 1");
   }
 
-  auto starts = act.sequenceStartPositions->getVector(useGpu(act.deviceId));
+  if (!argument_.value) {
+    argument_.value = Matrix::create(nullptr,
+                                     /* height= */ 1,
+                                     1,
+                                     /* trans= */ false,
+                                     useGpu(act.deviceId));
+    argument_.grad = Matrix::create(nullptr,
+                                    /* height= */ 1,
+                                    1,
+                                    /* trans= */ false,
+                                    useGpu(act.deviceId));
+  }
+
+  auto starts =
+      act.hasSubseq()
+          ? act.subSequenceStartPositions->getVector(useGpu(act.deviceId))
+          : act.sequenceStartPositions->getVector(useGpu(act.deviceId));
   act.value->sequenceSoftmax(*act.value, *starts);
+  return Error();
 }
 
-void backward(Argument& act) {
-  CHECK_EQ(act.grad->getWidth(), 1UL);
+Error __must_check backward(Argument& act) {
+  if (act.value->getWidth() != 1UL) {
+    return Error(
+        "Input width for each timestep of sequence softmax should be 1");
+  }
 
-  size_t numSequences = act.getNumSequences();
-  const int* starts = act.sequenceStartPositions->getData(false);
+  size_t numSequences =
+      act.hasSubseq() ? act.getNumSubSequences() : act.getNumSequences();
+  const int* starts = act.getCpuStartPositions();
 
   for (size_t i = 0; i < numSequences; ++i) {
     // TODO(Dangqingqing) optimization for GPU
@@ -150,14 +205,46 @@ void backward(Argument& act) {
     argument_.value->setData(act.value->getData() + offset, 1UL, size);
     argument_.grad->setData(act.grad->getData() + offset, 1UL, size);
 
-    softmax_.backward(argument_);
+    Error err = softmax_.backward(argument_);
+    if (!err.isOK()) return err;
   }
+  return Error();
 }
 END_DEFINE_ACTIVATION(sequence_softmax)
 
+/*
+ * @brief SoftSign Activation.
+ * \f[
+ * f(z) = \frac{z}{1 + |z|}
+ * \f]
+ */
+BEGIN_DEFINE_ACTIVATION(softsign)
+private:
+MatrixPtr denominator_;
+
+Error __must_check forward(Argument& act) {
+  size_t height = act.value->getHeight();
+  size_t width = act.value->getWidth();
+  Matrix::resizeOrCreate(
+      denominator_, height, width, false, useGpu(act.deviceId));
+  denominator_->assign(*act.value);
+  denominator_->abs2();
+  denominator_->add(1.);
+
+  act.value->dotDiv(*act.value, *denominator_);
+  return Error();
+}
+
+Error __must_check backward(Argument& act) {
+  denominator_->square2();
+  denominator_->scalarDiv(*denominator_, 1.);
+  act.grad->dotMul(*act.grad, *denominator_);
+  return Error();
+}
+END_DEFINE_ACTIVATION(softsign)
+
 /**
- * Relu Activation.
- *
+ * @brief Relu Activation.
  * forward. y = max(0, z)
  *
  * derivative of relu is:
@@ -167,13 +254,19 @@ END_DEFINE_ACTIVATION(sequence_softmax)
  *    0 otherwise.
  */
 BEGIN_DEFINE_ACTIVATION(relu)
-void forward(Argument& act) { act.value->relu(*act.value); }
+Error __must_check forward(Argument& act) {
+  act.value->relu(*act.value);
+  return Error();
+}
 
-void backward(Argument& act) { act.grad->reluDerivative(*act.value); }
+Error __must_check backward(Argument& act) {
+  act.grad->reluDerivative(*act.value);
+  return Error();
+}
 END_DEFINE_ACTIVATION(relu)
 
 /**
- * BRelu Activation.
+ * @brief BRelu Activation.
  *
  * forward. y = min(24, max(0, z))
  *
@@ -186,26 +279,40 @@ END_DEFINE_ACTIVATION(relu)
  * TODO(yuyang18): Remove magic number 24 or make it configuable.
  */
 BEGIN_DEFINE_ACTIVATION(brelu)
-void forward(Argument& act) { act.value->brelu(*act.value); }
+Error __must_check forward(Argument& act) {
+  act.value->brelu(*act.value);
+  return Error();
+}
 
-void backward(Argument& act) { act.grad->breluDerivative(*act.value); }
+Error __must_check backward(Argument& act) {
+  act.grad->breluDerivative(*act.value);
+  return Error();
+}
 END_DEFINE_ACTIVATION(brelu)
 
 /**
- * tanh activation.
- *
+ * @brief Tanh Activation.
+ * \f[
  * f(z) = tanh(z)=\frac{e^z-e^{-z}}{e^z+e^{-z}}
+ * \f]
  */
 BEGIN_DEFINE_ACTIVATION(tanh)
-void forward(Argument& act) { act.value->tanh(*act.value); }
+Error __must_check forward(Argument& act) {
+  act.value->tanh(*act.value);
+  return Error();
+}
 
-void backward(Argument& act) { act.grad->tanhDerivative(*act.value); }
+Error __must_check backward(Argument& act) {
+  act.grad->tanhDerivative(*act.value);
+  return Error();
+}
 END_DEFINE_ACTIVATION(tanh)
 
 /**
- * Scaled Tanh Activation
- *
+ * @brief Scaled Tanh Activation
+ * \f[
  * f(z) = 1.7159 * tanh(2/3*z)
+ * \f]
  */
 BEGIN_DEFINE_ACTIVATION(stanh)
 private:
@@ -213,27 +320,37 @@ real a, b;
 
 public:
 ACTIVATION_CLASS_NAME(stanh)() : a(1.7159), b(2. / 3.) {}
-void forward(Argument& act) { act.value->scaledTanh(*act.value, a, b); }
+Error __must_check forward(Argument& act) {
+  act.value->scaledTanh(*act.value, a, b);
+  return Error();
+}
 
-void backward(Argument& act) {
+Error __must_check backward(Argument& act) {
   act.grad->scaledTanhDerivative(*act.value, a, b);
+  return Error();
 }
 END_DEFINE_ACTIVATION(stanh)
 
 /**
- * Soft relu activation.
- *
+ * @brief Soft Relu Activation.
+ * \f[
  * f(z) = ln(1+e^z)
+ * \f]
  */
 BEGIN_DEFINE_ACTIVATION(softrelu)
-void forward(Argument& act) { act.value->softrelu(*act.value); }
+Error __must_check forward(Argument& act) {
+  act.value->softrelu(*act.value);
+  return Error();
+}
 
-void backward(Argument& act) { act.grad->softreluDerivative(*act.value); }
+Error __must_check backward(Argument& act) {
+  act.grad->softreluDerivative(*act.value);
+  return Error();
+}
 END_DEFINE_ACTIVATION(softrelu)
 
 /**
- * Abs Activation.
- *
+ * @brief Abs Activation.
  * Forward: f(z) = abs(z)
  *
  * Derivative:
@@ -245,44 +362,148 @@ END_DEFINE_ACTIVATION(softrelu)
  *     0   if z=0
  */
 BEGIN_DEFINE_ACTIVATION(abs)
-void forward(Argument& act) {
+Error __must_check forward(Argument& act) {
   SetDevice device(act.deviceId);
-  Matrix::resizeOrCreate(act.in, act.value->getHeight(), act.value->getWidth(),
-                         /* trans */ false, useGpu(act.deviceId));
+  Matrix::resizeOrCreate(act.in,
+                         act.value->getHeight(),
+                         act.value->getWidth(),
+                         /* trans */ false,
+                         useGpu(act.deviceId));
 
   act.in->copyFrom(*act.value);
-  act.value->abs(*act.value);
+  act.value->abs2(*act.value);
+  return Error();
 }
 
-void backward(Argument& act) { act.grad->absDerivative(*act.in); }
+Error __must_check backward(Argument& act) {
+  act.grad->absDerivative(*act.in);
+  return Error();
+}
 END_DEFINE_ACTIVATION(abs)
 
 /**
- * Square Activation.
- *
+ * @brief Square Activation.
+ * \f[
  * f(z) = z^2.
+ * \f]
  */
 BEGIN_DEFINE_ACTIVATION(square)
-void forward(Argument& act) {
+Error __must_check forward(Argument& act) {
   SetDevice device(act.deviceId);
-  Matrix::resizeOrCreate(act.in, act.value->getHeight(), act.value->getWidth(),
-                         /* trans */ false, useGpu(act.deviceId));
+  Matrix::resizeOrCreate(act.in,
+                         act.value->getHeight(),
+                         act.value->getWidth(),
+                         /* trans */ false,
+                         useGpu(act.deviceId));
 
   act.in->copyFrom(*act.value);
-  act.value->square(*act.value);
+  act.value->square2(*act.value);
+  return Error();
 }
 
-void backward(Argument& act) { act.grad->squareDerivative(*act.in); }
+Error __must_check backward(Argument& act) {
+  act.grad->squareDerivative(*act.in);
+  return Error();
+}
 END_DEFINE_ACTIVATION(square)
 
+/**
+ * @brief Exponential Activation.
+ * \f[
+ * f(z) = e^z
+ * \f]
+ */
 BEGIN_DEFINE_ACTIVATION(exponential)
-void forward(Argument& act) { act.value->exp(*act.value); }
+Error __must_check forward(Argument& act) {
+  act.value->exp2(*act.value);
+  return Error();
+}
 
-void backward(Argument& act) { act.grad->expDerivative(*act.value); }
+Error __must_check backward(Argument& act) {
+  act.grad->expDerivative(*act.value);
+  return Error();
+}
 END_DEFINE_ACTIVATION(exponential)
 
+/**
+ * @brief Reciprocal Activation.
+ * \f[
+ * f(z) = 1/z
+ * \f]
+ */
+BEGIN_DEFINE_ACTIVATION(reciprocal)
+Error __must_check forward(Argument& act) {
+  act.value->reciprocal2();
+  return Error();
+}
+
+Error __must_check backward(Argument& act) {
+  act.grad->dotMulSquare(*act.value);
+  act.grad->neg();
+  return Error();
+}
+END_DEFINE_ACTIVATION(reciprocal)
+
+/**
+ * @brief Square Root Activation.
+ * \f[
+ * f(z) = sqrt(z)
+ * \f]
+ */
+BEGIN_DEFINE_ACTIVATION(sqrt)
+Error __must_check forward(Argument& act) {
+  act.value->sqrt2();
+  return Error();
+}
+
+Error __must_check backward(Argument& act) {
+  act.grad->dotDiv(*act.grad, *act.value);
+  act.grad->mulScalar(0.5);
+  return Error();
+}
+END_DEFINE_ACTIVATION(sqrt)
+
+/**
+ * @brief Logarithm Activation.
+ * \f[
+ * f(z) = log(z)
+ * \f]
+ */
+BEGIN_DEFINE_ACTIVATION(log)
+Error __must_check forward(Argument& act) {
+  SetDevice device(act.deviceId);
+  Matrix::resizeOrCreate(act.in,
+                         act.value->getHeight(),
+                         act.value->getWidth(),
+                         /* trans */ false,
+                         useGpu(act.deviceId));
+
+  act.in->copyFrom(*act.value);
+  act.value->log2(*act.value);
+  return Error();
+}
+
+Error __must_check backward(Argument& act) {
+  act.grad->dotDiv(*act.grad, *act.in);
+  return Error();
+}
+END_DEFINE_ACTIVATION(log)
+
 ActivationFunction* ActivationFunction::create(const std::string& type) {
+#ifdef PADDLE_USE_MKLDNN
+  if (!type.empty() && type.compare(0, 7, "mkldnn_") == 0) {
+    return MKLDNNActivation::create(type);
+  }
+#endif
+
   return gActivationRegistrar.createByType(type);
+}
+
+std::vector<std::string> ActivationFunction::getAllRegisteredTypes() {
+  std::vector<std::string> types;
+  gActivationRegistrar.forEachType(
+      [&](const std::string& type) { types.push_back(type); });
+  return types;
 }
 
 }  // namespace paddle

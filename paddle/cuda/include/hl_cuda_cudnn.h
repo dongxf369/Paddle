@@ -1,4 +1,4 @@
-/* Copyright (c) 2016 Baidu, Inc. All Rights Reserve.
+/* Copyright (c) 2016 PaddlePaddle Authors. All Rights Reserve.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -12,7 +12,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
 
-
 #ifndef HL_CUDA_CUDNN_H_
 #define HL_CUDA_CUDNN_H_
 
@@ -22,11 +21,11 @@ limitations under the License. */
  *  hppl pooling mode
  */
 typedef enum {
-  HL_POOLING_MAX     = 0,
-  // average includes padded values
-  HL_POOLING_AVERAGE = 1,
+  HL_POOLING_MAX = 0,
   // average does not include padded values
-  HL_POOLING_AVERAGE_EXCLUDE_PADDING = 2,
+  HL_POOLING_AVERAGE = 1,
+  // average includes padded values
+  HL_POOLING_AVERAGE_INCLUDE_PADDING = 2,
   HL_POOLING_END
 } hl_pooling_mode_t;
 
@@ -215,7 +214,8 @@ extern void hl_conv_workspace(hl_tensor_descriptor input,
                               int* convBwdDataAlgo,
                               size_t* bwdDataLimitBytes,
                               int* convBwdFilterAlgo,
-                              size_t* bwdFilterLimitBytes);
+                              size_t* bwdFilterLimitBytes,
+                              bool useDilation);
 
 /**
  * @brief   destroy filter descriptor.
@@ -243,7 +243,9 @@ extern void hl_create_convolution_descriptor(hl_convolution_descriptor* conv,
                                              int padding_height,
                                              int padding_width,
                                              int stride_height,
-                                             int stride_width);
+                                             int stride_width,
+                                             int dilation_h = 1,
+                                             int dilation_w = 1);
 
 /**
  * @brief   reset convolution descriptor.
@@ -263,7 +265,9 @@ extern void hl_reset_convolution_descriptor(hl_convolution_descriptor conv,
                                             int padding_height,
                                             int padding_width,
                                             int stride_height,
-                                            int stride_width);
+                                            int stride_width,
+                                            int dilation_h = 1,
+                                            int dilation_w = 1);
 
 /**
  * @brief   destroy convolution descriptor.
@@ -324,17 +328,16 @@ extern void hl_convolution_forward_add_bias(hl_tensor_descriptor bias,
  * @param[in]   sizeInBytes         gpu workspace size (bytes).
  * @param[in]   convBwdFilterAlgo   backward filter algorithm.
  */
-extern void hl_convolution_backward_filter(
-        hl_tensor_descriptor input,
-        real* input_data,
-        hl_tensor_descriptor output,
-        real* output_grad_data,
-        hl_filter_descriptor filter,
-        real* filter_grad_data,
-        hl_convolution_descriptor conv,
-        void* gpuWorkSpace,
-        size_t sizeInBytes,
-        int  convBwdFilterAlgo);
+extern void hl_convolution_backward_filter(hl_tensor_descriptor input,
+                                           real* input_data,
+                                           hl_tensor_descriptor output,
+                                           real* output_grad_data,
+                                           hl_filter_descriptor filter,
+                                           real* filter_grad_data,
+                                           hl_convolution_descriptor conv,
+                                           void* gpuWorkSpace,
+                                           size_t sizeInBytes,
+                                           int convBwdFilterAlgo);
 
 /**
  * @brief   convolution backward data(calculate input image grad data).
@@ -350,17 +353,16 @@ extern void hl_convolution_backward_filter(
  * @param[in]   sizeInBytes         gpu workspace size (bytes).
  * @param[in]   convBwdDataAlgo     backward data algorithm.
  */
-extern void hl_convolution_backward_data(
-        hl_tensor_descriptor input,
-        real* input_data_grad,
-        hl_tensor_descriptor output,
-        real* output_grad_data,
-        hl_filter_descriptor filter,
-        real* filter_data,
-        hl_convolution_descriptor conv,
-        void* gpuWorkSpace,
-        size_t sizeInBytes,
-        int convBwdDataAlgo);
+extern void hl_convolution_backward_data(hl_tensor_descriptor input,
+                                         real* input_data_grad,
+                                         hl_tensor_descriptor output,
+                                         real* output_grad_data,
+                                         hl_filter_descriptor filter,
+                                         real* filter_data,
+                                         hl_convolution_descriptor conv,
+                                         void* gpuWorkSpace,
+                                         size_t sizeInBytes,
+                                         int convBwdDataAlgo);
 
 /**
  * @brief   convolution backward bias(calculate bias grad data).
@@ -383,8 +385,8 @@ extern void hl_convolution_backward_bias(hl_tensor_descriptor bias,
  * @param[in]   height              matrix height.
  * @param[in]   width               matrix width.
  */
-extern void hl_softmax_forward(real *input,
-                               real *output,
+extern void hl_softmax_forward(real* input,
+                               real* output,
                                int height,
                                int width);
 
@@ -396,8 +398,8 @@ extern void hl_softmax_forward(real *input,
  * @param[in]   height              matrix height.
  * @param[in]   width               matrix width.
  */
-extern void hl_softmax_backward(real *output_value,
-                                real *output_grad,
+extern void hl_softmax_backward(real* output_value,
+                                real* output_grad,
                                 int height,
                                 int width);
 
@@ -426,18 +428,18 @@ extern void hl_softmax_backward(real *output_value,
  *
  */
 extern void hl_batch_norm_forward_training(hl_tensor_descriptor inputDesc,
-                                           real *input,
+                                           real* input,
                                            hl_tensor_descriptor outputDesc,
-                                           real *output,
+                                           real* output,
                                            hl_tensor_descriptor bnParamDesc,
-                                           real *scale,
-                                           real *bias,
+                                           real* scale,
+                                           real* bias,
                                            double factor,
-                                           real *runningMean,
-                                           real *runningInvVar,
+                                           real* runningMean,
+                                           real* runningInvVar,
                                            double epsilon,
-                                           real *savedMean,
-                                           real *savedVar);
+                                           real* savedMean,
+                                           real* savedVar);
 
 /**
  * @brief   cudnn batch norm forward.
@@ -463,14 +465,14 @@ extern void hl_batch_norm_forward_training(hl_tensor_descriptor inputDesc,
  *
  */
 extern void hl_batch_norm_forward_inference(hl_tensor_descriptor inputDesc,
-                                            real *input,
+                                            real* input,
                                             hl_tensor_descriptor outputDesc,
-                                            real *output,
+                                            real* output,
                                             hl_tensor_descriptor bnParamDesc,
-                                            real *scale,
-                                            real *bias,
-                                            real *estimatedMean,
-                                            real *estimatedVar,
+                                            real* scale,
+                                            real* bias,
+                                            real* estimatedMean,
+                                            real* estimatedVar,
                                             double epsilon);
 
 /**
@@ -483,7 +485,8 @@ extern void hl_batch_norm_forward_inference(hl_tensor_descriptor inputDesc,
  * @param[in]   inGradDesc      input tensor descriptor desc.
  * @param[in]   inGrad          input data.
  * @param[in]   dBnParamDesc    tensor descriptor desc.
- *                              bnScale, bnBias, running mean/var, save_mean/var.
+ *                              bnScale, bnBias, running mean/var,
+ * save_mean/var.
  * @param[in]   scale           batch normalization scale parameter (in original
  *                              paper scale is referred to as gamma).
  * @param[in]   scaleGrad       batch normalization scale parameter (in original
@@ -497,17 +500,17 @@ extern void hl_batch_norm_forward_inference(hl_tensor_descriptor inputDesc,
  *
  */
 extern void hl_batch_norm_backward(hl_tensor_descriptor inputDesc,
-                                   real *input,
+                                   real* input,
                                    hl_tensor_descriptor outGradDesc,
-                                   real *outGrad,
+                                   real* outGrad,
                                    hl_tensor_descriptor inGradDesc,
-                                   real *inGrad,
+                                   real* inGrad,
                                    hl_tensor_descriptor dBnParamDesc,
-                                   real *scale,
-                                   real *scaleGrad,
-                                   real *biasGrad,
+                                   real* scale,
+                                   real* scaleGrad,
+                                   real* biasGrad,
                                    double epsilon,
-                                   real *savedMean,
-                                   real *savedInvVar);
+                                   real* savedMean,
+                                   real* savedInvVar);
 
 #endif  // HL_CUDA_CUDNN_H_

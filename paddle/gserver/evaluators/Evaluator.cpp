@@ -1,4 +1,4 @@
-/* Copyright (c) 2016 Baidu, Inc. All Rights Reserve.
+/* Copyright (c) 2016 PaddlePaddle Authors. All Rights Reserve.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -12,13 +12,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
 
-
-#include "paddle/utils/Stat.h"
 #include "paddle/gserver/evaluators/Evaluator.h"
-
 #include "paddle/gserver/gradientmachines/NeuralNetwork.h"
+#include "paddle/utils/Stat.h"
+#include "paddle/utils/StringUtil.h"
 
-P_DECLARE_int32(trainer_id);
+DECLARE_int32(trainer_id);
 
 namespace paddle {
 
@@ -33,9 +32,21 @@ void Evaluator::eval(const NeuralNetwork& nn) {
   totalScore_ += score;
   updateSamplesNum(arguments);
 }
-
+/**
+ * @brief classification error Evaluator
+ *
+ * The config file api is classification_error_evaluator.
+ */
 class ClassificationErrorEvaluator : public Evaluator {
 public:
+  /*
+  ClassificationErrorEvaluator() : totalScore2_(0) {}
+
+  virtual void start() {
+    Evaluator::start();
+    totalScore2_ = 0;
+    } */
+
   virtual void updateSamplesNum(const std::vector<Argument>& arguments) {
     if (3 == arguments.size()) {
       numSamples_ += arguments[2].value->getSum();
@@ -70,23 +81,37 @@ public:
     }
 
     const MatrixPtr errorMat = Matrix::create(output->getHeight(),
-      1, /* trans= */ false, useGpu(arguments[0].deviceId));
+                                              1,
+                                              /* trans= */ false,
+                                              useGpu(arguments[0].deviceId));
+
     errorMat->zeroMem();
+
     if (label != nullptr) {
-      errorMat->classificationError(output, label);
+      errorMat->classificationError(*output, *label, config_.top_k());
     } else if (dynamic_cast<CpuSparseMatrix*>(multiBinaryLabel.get()) ||
                dynamic_cast<GpuSparseMatrix*>(multiBinaryLabel.get())) {
-      errorMat->classificationErrorMulti(*output, *multiBinaryLabel,
-                                         config_.classification_threshold());
+      errorMat->classificationErrorMulti(
+          *output, *multiBinaryLabel, config_.classification_threshold());
     } else {
-      errorMat->binaryClassificationError(0, *output, *multiBinaryLabel,
-                                          config_.classification_threshold());
+      errorMat->binaryClassificationError(
+          0, *output, *multiBinaryLabel, config_.classification_threshold());
     }
 
     if (supportWeight) {
       errorMat->dotMul(*errorMat, *weight);
     }
     return errorMat;
+  }
+
+  void printStats(std::ostream& os) const {
+    if (config_.top_k() == 1) {
+      os << config_.name() << "="
+         << (numSamples_ ? totalScore_ / numSamples_ : 0);
+    } else {
+      os << " top_" << config_.top_k()
+         << "_error=" << (numSamples_ ? totalScore_ / numSamples_ : 0);
+    }
   }
 
   virtual real evalImp(std::vector<Argument>& arguments) {
@@ -97,10 +122,17 @@ public:
   virtual void distributeEval(ParameterClient2* client) {
     mergeResultsOfAllClients(client);
   }
+
+  // Evaluator interface
+protected:
+  std::string getTypeImpl() const { return "classification_error"; }
 };
 
-// sequence level classification error stats:
-//   if any frame in one sequence has error, the sequence is error
+/**
+ * @brief sequence classification error Evaluator
+ * @note sequence level classification error stats,
+ * if any frame in one sequence has error, the sequence is error
+ */
 class SequenceClassificationErrorEvaluator
     : public ClassificationErrorEvaluator {
 public:
@@ -119,8 +151,8 @@ public:
     int errCounter = 0;
     CpuVector errorVec(0, nullptr);
     for (size_t i = 0; i < sequenceStartPositions->getSize() - 1; ++i) {
-      errorVec.subVecFrom(errorMat->getData(), starts[i],
-                          starts[i + 1] - starts[i]);
+      errorVec.subVecFrom(
+          errorMat->getData(), starts[i], starts[i + 1] - starts[i]);
       if (errorVec.getSum() > 0) {
         errCounter += 1;
       }
@@ -132,10 +164,19 @@ public:
   virtual void distributeEval(ParameterClient2* client) {
     mergeResultsOfAllClients(client);
   }
+
+  // Evaluator interface
+protected:
+  std::string getTypeImpl() const { return "seq_classification_error"; }
 };
 REGISTER_EVALUATOR(seq_classification_error,
                    SequenceClassificationErrorEvaluator);
-
+/**
+ * @brief sum Evaluator
+ * Calculate the sum of output or label
+ *
+ * The config file api is sum_evaluator.
+ */
 class SumEvaluator : public Evaluator {
 public:
   SumEvaluator() : cpuLabel_(nullptr), cpuWeight_(nullptr) {}
@@ -217,14 +258,23 @@ public:
 private:
   IVectorPtr cpuLabel_;
   MatrixPtr cpuWeight_;
-};
 
+  // Evaluator interface
+protected:
+  std::string getTypeImpl() const { return "sum"; }
+};
+/**
+ * @brief column sum Evaluator
+ * @note column sum for the colIdx-th column *
+ * - colIdx = 0: the 0-th column.
+ * - colIdx > 0: the colIdx-th column.
+ * - colIdx < 0: the last colIdx-th column.
+ *
+ * The config file api is column_sum_evaluator.
+ *
+ */
 class ColumnSumEvaluator : public Evaluator {
 public:
-  // column sum for the colIdx-th column
-  // colIdx = 0: the 0-th column
-  //         > 0: the colIdx-th column
-  //         < 0: the last colIdx-th column
   explicit ColumnSumEvaluator(int32_t colIdx)
       : colIdx_(colIdx), colNum_(0), sum_(nullptr) {}
 
@@ -298,7 +348,7 @@ public:
     return 0;
   }
 
-  virtual void printStats(std::ostream& os) {
+  virtual void printStats(std::ostream& os) const {
     CHECK(colIdx_ + (int32_t)colNum_ >= 0 && colIdx_ - (int32_t)colNum_ < 0)
         << "column index [" << colIdx_ << "] out of range [-" << colNum_ << ", "
         << colNum_ << ")";
@@ -313,16 +363,24 @@ public:
   }
 
   void distributeEval(ParameterClient2* client) {
-    client->reduce(sum_->getData(), sum_->getData(), colNum_, FLAGS_trainer_id,
-                   0);
+    client->reduce(
+        sum_->getData(), sum_->getData(), colNum_, FLAGS_trainer_id, 0);
     client->reduce(&numSamples_, &numSamples_, 1, FLAGS_trainer_id, 0);
   }
 
 private:
-  ColumnSumEvaluator() {}
   int32_t colIdx_;
   size_t colNum_;
   MatrixPtr sum_; /* cpu matrix */
+
+  // Evaluator interface
+protected:
+  std::string getTypeImpl() const {
+    if (colIdx_ == -1)
+      return "last-column-sum";
+    else
+      return "column-sum";
+  }
 };
 
 void AucEvaluator::start() {
@@ -337,14 +395,24 @@ real AucEvaluator::evalImp(std::vector<Argument>& arguments) {
   CHECK_LE(arguments.size(), (size_t)3);
   MatrixPtr output = arguments[0].value;
   IVectorPtr label = arguments[1].ids;
+  MatrixPtr labelval = arguments[1].value;
   bool supportWeight = (3 == arguments.size()) ? true : false;
   MatrixPtr weight = supportWeight ? arguments[2].value : nullptr;
-  if (nullptr == output || nullptr == label ||
-      (supportWeight && nullptr == weight)) {
+
+  if (nullptr == output || (supportWeight && nullptr == weight)) {
     return 0;
   }
   size_t insNum = output->getHeight();
   size_t outputDim = output->getWidth();
+  // Copy label from value to a vector.
+  if (nullptr == label && nullptr != labelval) {
+    // label width is 1
+    CHECK_EQ(1U, labelval->getWidth());
+    VectorPtr vec =
+        Vector::create(labelval->getData(), insNum, output->useGpu());
+    label = vec->castToInt();
+  }
+
   CHECK_EQ(insNum, label->getSize());
   if (supportWeight) {
     CHECK_EQ(insNum, weight->getHeight());
@@ -362,8 +430,11 @@ real AucEvaluator::evalImp(std::vector<Argument>& arguments) {
   }
 
   if (dynamic_cast<GpuMatrix*>(output.get())) {
-    Matrix::resizeOrCreate(cpuOutput_, insNum, outputDim,
-                           /* trans=*/false, /* useGpu=*/false);
+    Matrix::resizeOrCreate(cpuOutput_,
+                           insNum,
+                           outputDim,
+                           /* trans=*/false,
+                           /* useGpu=*/false);
     cpuOutput_->copyFrom(*output);
     IVector::resizeOrCreate(cpuLabel_, insNum, false);
     cpuLabel_->copyFrom(*label);
@@ -382,6 +453,7 @@ real AucEvaluator::evalImp(std::vector<Argument>& arguments) {
   int* labelD = label->getData();
   real* weightD = supportWeight ? weight->getData() : nullptr;
   size_t pos = realColumnIdx_;
+
   for (size_t i = 0; i < insNum; ++i) {
     real value = outputD[pos];
     uint32_t binIdx = static_cast<uint32_t>(value * kBinNum_);
@@ -404,7 +476,7 @@ void AucEvaluator::distributeEval(ParameterClient2* client) {
   client->reduce(statNeg_, statNeg_, kBinNum_ + 1, FLAGS_trainer_id, 0);
 }
 
-double AucEvaluator::calcAuc() {
+double AucEvaluator::calcAuc() const {
   double totPos = 0.0;
   double totNeg = 0.0;
   double totPosPrev = 0.0;
@@ -425,6 +497,16 @@ double AucEvaluator::calcAuc() {
     return auc / totPos / totNeg;
   } else {
     return 0.0;
+  }
+}
+
+real AucEvaluator::getValueImpl() const { return calcAuc(); }
+
+std::string AucEvaluator::getTypeImpl() const {
+  if (colIdx_ == -1) {
+    return "last-column-auc";
+  } else {
+    return "auc";
   }
 }
 
@@ -462,19 +544,24 @@ real RankAucEvaluator::evalImp(std::vector<Argument>& arguments) {
   for (size_t i = 0; i < batchNum; ++i) {
     int beginPos = startPosData[i];
     int endPos = startPosData[i + 1];
-    batchAuc += calcRankAuc(outputData + beginPos, clickData + beginPos,
-                            pvData + beginPos, endPos - beginPos);
+    batchAuc += calcRankAuc(outputData + beginPos,
+                            clickData + beginPos,
+                            pvData + beginPos,
+                            endPos - beginPos);
   }
   return batchAuc;
 }
 
-double RankAucEvaluator::calcRankAuc(real* outputData, real* clickData,
-                                     real* pvData, size_t size) {
+double RankAucEvaluator::calcRankAuc(real* outputData,
+                                     real* clickData,
+                                     real* pvData,
+                                     size_t size) {
   outputPair_.clear();
   for (size_t i = 0; i < size; ++i) {
     outputPair_.push_back(std::make_pair(outputData[i], i));
   }
-  std::sort(outputPair_.begin(), outputPair_.end(),
+  std::sort(outputPair_.begin(),
+            outputPair_.end(),
             [](const std::pair<real, int>& a, const std::pair<real, int>& b) {
               return a.first > b.first;
             });
@@ -502,12 +589,15 @@ double RankAucEvaluator::calcRankAuc(real* outputData, real* clickData,
                                         : aucTmp / (clickSum * noClickSum);
 }
 
+std::string RankAucEvaluator::getTypeImpl() const { return "rankauc"; }
+
 // class PrecisionRecallEvaluator
 REGISTER_EVALUATOR(precision_recall, PrecisionRecallEvaluator);
 
 void PrecisionRecallEvaluator::start() {
   Evaluator::start();
   statsInfo_.clear();
+  values_.clear();
 }
 
 real PrecisionRecallEvaluator::evalImp(std::vector<Argument>& arguments) {
@@ -567,53 +657,24 @@ real PrecisionRecallEvaluator::evalImp(std::vector<Argument>& arguments) {
   return 0;
 }
 
-void PrecisionRecallEvaluator::printStats(std::ostream& os) {
-  int label = config_.positive_label();
-  if (label != -1) {
-    CHECK(label >= 0 && label < (int)statsInfo_.size())
-        << "positive_label [" << label << "] should be in range [0, "
-        << statsInfo_.size() << ")";
-    double precision =
-        calcPrecision(statsInfo_[label].TP, statsInfo_[label].FP);
-    double recall = calcRecall(statsInfo_[label].TP, statsInfo_[label].FN);
-    os << "positive_label=" << label << " precision=" << precision
-       << " recall=" << recall
-       << " F1-score=" << calcF1Score(precision, recall);
-    return;
-  }
-
-  // micro average method: precision = (TP1+TP2)/(TP1+FP1+TP2+FP2)
-  // macro average method: precision = (precision1+precision2)/2
-  double microTotalTP = 0;
-  double microTotalFP = 0;
-  double microTotalFN = 0;
-  double macroAvgPrecision = 0;
-  double macroAvgRecall = 0;
-  size_t numLabels = statsInfo_.size();
-  for (size_t i = 0; i < numLabels; ++i) {
-    microTotalTP += statsInfo_[i].TP;
-    microTotalFP += statsInfo_[i].FP;
-    microTotalFN += statsInfo_[i].FN;
-    macroAvgPrecision += calcPrecision(statsInfo_[i].TP, statsInfo_[i].FP);
-    macroAvgRecall += calcRecall(statsInfo_[i].TP, statsInfo_[i].FN);
-  }
-  macroAvgPrecision /= numLabels;
-  macroAvgRecall /= numLabels;
-  double macroAvgF1Score = calcF1Score(macroAvgPrecision, macroAvgRecall);
-  os << "macro-average-precision=" << macroAvgPrecision
-     << " macro-average-recall=" << macroAvgRecall
-     << " macro-average-F1-score=" << macroAvgF1Score;
-
-  double microAvgPrecision = calcPrecision(microTotalTP, microTotalFP);
-  double microAvgRecall = calcPrecision(microTotalTP, microTotalFN);
-  double microAvgF1Score = calcF1Score(microAvgPrecision, microAvgRecall);
-  if (!isMultiBinaryLabel_) {
-    // precision and recall are equal in this case
-    os << " micro-average-precision=" << microAvgPrecision;
-  } else {
-    os << " micro-average-precision=" << microAvgPrecision
-       << " micro-average-recall=" << microAvgRecall
-       << " micro-average-F1-score=" << microAvgF1Score;
+void PrecisionRecallEvaluator::printStats(std::ostream& os) const {
+  PrintStatsInfo info;
+  bool containMacroMicroInfo = getStatsInfo(&info);
+  os << "positive_label=" << config_.positive_label()
+     << " precision=" << info.precision << " recall=" << info.recall
+     << " F1-score=" << info.f1;
+  if (containMacroMicroInfo) {
+    os << "macro-average-precision=" << info.macroAvgPrecision
+       << " macro-average-recall=" << info.macroAvgRecall
+       << " macro-average-F1-score=" << info.macroAvgF1Score;
+    if (!isMultiBinaryLabel_) {
+      // precision and recall are equal in this case
+      os << " micro-average-precision=" << info.microAvgPrecision;
+    } else {
+      os << " micro-average-precision=" << info.microAvgPrecision
+         << " micro-average-recall=" << info.microAvgRecall
+         << " micro-average-F1-score=" << info.microAvgF1Score;
+    }
   }
 }
 
@@ -695,6 +756,60 @@ void PrecisionRecallEvaluator::calcStatsInfoMulti(const MatrixPtr& output,
   }
 }
 
+void PrecisionRecallEvaluator::storeLocalValues() const {
+  if (this->values_.size() == 0) {
+    PrintStatsInfo info;
+    bool containMacroMicroInfo = getStatsInfo(&info);
+    values_["precision"] = info.precision;
+    values_["recal"] = info.recall;
+    values_["F1-score"] = info.f1;
+    if (containMacroMicroInfo) {
+      values_["macro-average-precision"] = info.macroAvgPrecision;
+      values_["macro-average-recall"] = info.macroAvgRecall;
+      values_["macro-average-F1-score"] = info.macroAvgF1Score;
+      if (!isMultiBinaryLabel_) {
+        // precision and recall are equal in this case
+        values_["micro-average-precision"] = info.microAvgPrecision;
+      } else {
+        values_["micro-average-precision"] = info.microAvgPrecision;
+        values_["micro-average-recall"] = info.microAvgRecall;
+        values_["micro-average-F1-score"] = info.microAvgF1Score;
+      }
+    }
+  }
+}
+
+void PrecisionRecallEvaluator::getNames(std::vector<std::string>* names) {
+  this->storeLocalValues();
+  names->reserve(this->values_.size());
+  for (auto it = this->values_.begin(); it != this->values_.end(); ++it) {
+    names->push_back(this->config_.name() + "." + it->first);
+  }
+}
+
+real PrecisionRecallEvaluator::getValue(const std::string& name,
+                                        Error* err) const {
+  this->storeLocalValues();
+  std::vector<std::string> buffers;
+  paddle::str::split(name, '.', &buffers);
+  auto it = this->values_.find(buffers[buffers.size() - 1]);
+  if (it == this->values_.end()) {  // not found
+    *err = Error("No such key %s", name.c_str());
+    return .0f;
+  }
+
+  return it->second;
+}
+
+std::string PrecisionRecallEvaluator::getType(const std::string& name,
+                                              Error* err) const {
+  this->getValue(name, err);
+  if (!err->isOK()) {
+    return "";
+  }
+  return "precision_recall";
+}
+
 void PrecisionRecallEvaluator::distributeEval(ParameterClient2* client) {
   size_t size = 4 * statsInfo_.size();
   double* buf = new double[size];
@@ -712,6 +827,47 @@ void PrecisionRecallEvaluator::distributeEval(ParameterClient2* client) {
     statsInfo_[i].FN = buf[4 * i + 3];
   }
   delete[] buf;
+}
+
+bool PrecisionRecallEvaluator::getStatsInfo(
+    PrecisionRecallEvaluator::PrintStatsInfo* info) const {
+  int label = config_.positive_label();
+  if (label != -1) {
+    CHECK(label >= 0 && label < (int)statsInfo_.size())
+        << "positive_label [" << label << "] should be in range [0, "
+        << statsInfo_.size() << ")";
+    info->precision = calcPrecision(statsInfo_[label].TP, statsInfo_[label].FP);
+    info->recall = calcRecall(statsInfo_[label].TP, statsInfo_[label].FN);
+    info->f1 = calcF1Score(info->precision, info->recall);
+    return false;
+  }
+
+  // micro average method: precision = (TP1+TP2)/(TP1+FP1+TP2+FP2)
+  // macro average method: precision = (precision1+precision2)/2
+  double microTotalTP = 0;
+  double microTotalFP = 0;
+  double microTotalFN = 0;
+  info->macroAvgPrecision = 0;
+  info->macroAvgRecall = 0;
+  size_t numLabels = statsInfo_.size();
+  for (size_t i = 0; i < numLabels; ++i) {
+    microTotalTP += statsInfo_[i].TP;
+    microTotalFP += statsInfo_[i].FP;
+    microTotalFN += statsInfo_[i].FN;
+    info->macroAvgPrecision +=
+        calcPrecision(statsInfo_[i].TP, statsInfo_[i].FP);
+    info->macroAvgRecall += calcRecall(statsInfo_[i].TP, statsInfo_[i].FN);
+  }
+  info->macroAvgPrecision /= numLabels;
+  info->macroAvgRecall /= numLabels;
+  info->macroAvgF1Score =
+      calcF1Score(info->macroAvgPrecision, info->macroAvgRecall);
+
+  info->microAvgPrecision = calcPrecision(microTotalTP, microTotalFP);
+  info->microAvgRecall = calcPrecision(microTotalTP, microTotalFN);
+  info->microAvgF1Score =
+      calcF1Score(info->microAvgPrecision, info->microAvgRecall);
+  return true;
 }
 
 REGISTER_EVALUATOR(pnpair, PnpairEvaluator);
@@ -773,8 +929,12 @@ real PnpairEvaluator::evalImp(std::vector<Argument>& arguments) {
   return 0;
 }
 
-void PnpairEvaluator::stat(size_t start, size_t end, PredictionResult* answers,
-                           double& pos, double& neg, double& spe) {
+void PnpairEvaluator::stat(size_t start,
+                           size_t end,
+                           PredictionResult* answers,
+                           double& pos,
+                           double& neg,
+                           double& spe) {
   for (size_t i = start; i < end; i++) {
     for (size_t j = i + 1; j < end; j++) {
       CHECK_EQ(answers[i].queryid, answers[j].queryid);
@@ -800,7 +960,8 @@ void PnpairEvaluator::stat(size_t start, size_t end, PredictionResult* answers,
 }
 
 void PnpairEvaluator::calc(std::vector<PredictionResult>& predictArray) {
-  std::sort(predictArray.begin(), predictArray.end(),
+  std::sort(predictArray.begin(),
+            predictArray.end(),
             [](const PredictionResult& x, const PredictionResult& y) {
               return x.queryid < y.queryid;
             });
@@ -811,11 +972,16 @@ void PnpairEvaluator::calc(std::vector<PredictionResult>& predictArray) {
   auto start = predictArray.begin();
   while (start != predictArray.end()) {
     auto end = std::find_if(
-        start + 1, predictArray.end(),
-        [=](const PredictionResult& x) { return x.queryid != start->queryid; });
+        start + 1, predictArray.end(), [=](const PredictionResult& x) {
+          return x.queryid != start->queryid;
+        });
     CHECK(end != start);
-    stat(start - predictArray.begin(), end - predictArray.begin(),
-         predictArray.data(), pos, neg, special);
+    stat(start - predictArray.begin(),
+         end - predictArray.begin(),
+         predictArray.data(),
+         pos,
+         neg,
+         special);
 
     start = end;
   }
@@ -828,52 +994,35 @@ void PnpairEvaluator::calc(std::vector<PredictionResult>& predictArray) {
             << " calc total special pair: " << special;
 }
 
+std::string PnpairEvaluator::getTypeImpl() const { return "pnpair"; }
+
 ClassRegistrar<Evaluator> Evaluator::registrar_;
 Evaluator* Evaluator::create(const EvaluatorConfig& config) {
-  Evaluator* evaluator = nullptr;
-  if (config.type() == "classification_error") {
-    evaluator = new ClassificationErrorEvaluator();
-  } else if (config.type() == "sum") {
-    evaluator = new SumEvaluator();
-  } else if (config.type() == "last-column-sum") {
-    evaluator = new ColumnSumEvaluator(-1);
-  } else if (config.type() == "last-column-auc") {
-    evaluator = new AucEvaluator(-1);
-  } else {
-    evaluator = registrar_.createByType(config.type());
-  }
+  Evaluator* evaluator = registrar_.createByType(config.type());
   evaluator->init(config);
   return evaluator;
 }
 
-class ValuePrinter : public Evaluator {
-public:
-  ValuePrinter() {}
+REGISTER_EVALUATOR(classification_error, ClassificationErrorEvaluator);
+REGISTER_EVALUATOR(sum, SumEvaluator);
+static InitFunction __reg_type_auc_sum__([]() {
+  Evaluator::registrar_.registerClass(
+      "last-column-sum", [] { return new ColumnSumEvaluator(-1); });
+  Evaluator::registrar_.registerClass("last-column-auc",
+                                      [] { return new AucEvaluator(-1); });
+});
 
+/**
+ * @brief print value of each layer.
+ *
+ * The config file api is value_printer_evaluator.
+ */
+class ValuePrinter : public NotGetableEvaluator {
+public:
   virtual void eval(const NeuralNetwork& nn) {
     for (const std::string& name : config_.input_layers()) {
-      const Argument& argu = nn.getLayer(name)->getOutput();
-      if (argu.value) {
-        std::ostringstream os;
-        argu.value->print(os);
-        LOG(INFO) << "layer=" << name << " value matrix:\n" << os.str();
-      }
-      if (argu.ids) {
-        std::ostringstream os;
-        argu.ids->print(os, argu.ids->getSize());
-        LOG(INFO) << "layer=" << name << " ids vector:\n" << os.str();
-      }
-      if (auto startPos = argu.sequenceStartPositions) {
-        std::ostringstream os;
-        startPos->getVector(false)->print(os, startPos->getSize());
-        LOG(INFO) << "layer=" << name << " sequence pos vector:\n" << os.str();
-      }
-      if (auto subStartPos = argu.subSequenceStartPositions) {
-        std::ostringstream os;
-        subStartPos->getVector(false)->print(os, subStartPos->getSize());
-        LOG(INFO) << "layer=" << name << " sub-sequence pos vector:\n"
-                  << os.str();
-      }
+      nn.getLayer(name)->getOutput().printValueString(LOG(INFO),
+                                                      "layer=" + name + " ");
     }
   }
 
@@ -883,10 +1032,13 @@ public:
 };
 REGISTER_EVALUATOR(value_printer, ValuePrinter);
 
-class GradientPrinter : public Evaluator {
+/**
+ * @brief print gradient of each layer.
+ *
+ * The config file api is gradient_printer_evaluator.
+ */
+class GradientPrinter : public NotGetableEvaluator {
 public:
-  GradientPrinter() {}
-
   virtual void eval(const NeuralNetwork& nn) {
     for (const std::string& name : config_.input_layers()) {
       const Argument& argu = nn.getLayer(name)->getOutput();
@@ -894,11 +1046,6 @@ public:
         std::ostringstream os;
         argu.grad->print(os);
         LOG(INFO) << "layer=" << name << " grad matrix:\n" << os.str();
-      }
-      if (auto startPos = argu.sequenceStartPositions) {
-        std::ostringstream os;
-        startPos->getVector(false)->print(os, startPos->getSize());
-        LOG(INFO) << "layer=" << name << " sequence pos vector:\n" << os.str();
       }
     }
   }
@@ -908,8 +1055,12 @@ public:
   virtual real evalImp(std::vector<Argument>& arguments) { return 0; }
 };
 REGISTER_EVALUATOR(gradient_printer, GradientPrinter);
-
-class MaxIdPrinter : public Evaluator {
+/**
+ * @brief print row max id vctor of each layer
+ *
+ * The config file api is maxid_printer_evaluator.
+ */
+class MaxIdPrinter : public NotGetableEvaluator {
 private:
   IVectorPtr maxIds_;
   MatrixPtr maxValues_;
@@ -946,8 +1097,12 @@ public:
   virtual real evalImp(std::vector<Argument>& arguments) { return 0; }
 };
 REGISTER_EVALUATOR(max_id_printer, MaxIdPrinter);
-
-class MaxFramePrinter : public Evaluator {
+/**
+ * @brief print sequence max frames of each layer
+ *
+ * The config file api is maxframe_printer_evaluator.
+ */
+class MaxFramePrinter : public NotGetableEvaluator {
 private:
   IVectorPtr maxIds_;
   MatrixPtr maxValues_;
@@ -998,30 +1153,29 @@ public:
 REGISTER_EVALUATOR(max_frame_printer, MaxFramePrinter);
 
 /**
- * Sequence text printer will print text according to index matrix and a
- * dictionary. There can be multiple input to this layer:
+ * @brief print text according to index matrix and a dictionary.
  *
- *   1) If there is only one input, the input must be a matrix containing
+ * There can be multiple input to this layer:
+ * - If there is only one input, the input must be a matrix containing
  *      the sequence of indices;
- *
- *   2) If there are more than one input, the first input should be ids,
+ * - If there are more than one input, the first input should be ids,
  *      and are interpreted as sample ids.
  *
  * The output format will be:
  *
- *   1) sequence without sub-sequence, and there is probability.
+ * - sequence without sub-sequence, and there is probability.
  *
  *     @code
  *      id \t prob space_seperated_tokens_from_dictionary_according_to_seq
  *     @endcode
  *
- *   2) sequence without sub-sequence, and there is not probability.
+ * - sequence without sub-sequence, and there is not probability.
  *
  *     @code
  *      id \t space_seperated_tokens_from_dictionary_according_to_seq
  *     @endcode
  *
- *   3) sequence with sub-sequence, and there is not probability.
+ * - sequence with sub-sequence, and there is not probability.
  *
  *     @code
  *      id \t space_seperated_tokens_from_dictionary_according_to_sub_seq
@@ -1032,8 +1186,10 @@ REGISTER_EVALUATOR(max_frame_printer, MaxFramePrinter);
  * Typically SequenceTextPrinter layer takes output of maxid or RecurrentGroup
  * with maxid (when generating) as an input.
  *
+ * The config file api is seqtext_printer_evaluator.
+ *
  */
-class SequenceTextPrinter : public Evaluator {
+class SequenceTextPrinter : public NotGetableEvaluator {
 private:
   /// dict_file, which contains a list of tokens
   std::vector<std::string> dict_;
@@ -1086,8 +1242,8 @@ public:
 
     auto resizeMatrix = [](MatrixPtr& dest, const MatrixPtr& src) {
       if (src && src->useGpu()) {
-        Matrix::resizeOrCreate(dest, src->getHeight(), src->getWidth(), false,
-                               false);
+        Matrix::resizeOrCreate(
+            dest, src->getHeight(), src->getWidth(), false, false);
         dest->copyFrom(*src);
       } else {
         dest = src;
@@ -1172,7 +1328,11 @@ public:
   }
 };
 REGISTER_EVALUATOR(seq_text_printer, SequenceTextPrinter);
-
+/**
+ * @brief print classification error.
+ *
+ * The config file api is classification_error_printer_evaluator.
+ */
 class ClassificationErrorPrinter : public ClassificationErrorEvaluator {
 public:
   virtual void updateSamplesNum(const std::vector<Argument>& arguments) {}
@@ -1195,5 +1355,7 @@ public:
   }
 };
 REGISTER_EVALUATOR(classification_error_printer, ClassificationErrorPrinter);
+
+std::string DummyEvaluator::getTypeImpl() const { return "dummy"; }
 
 }  // namespace paddle

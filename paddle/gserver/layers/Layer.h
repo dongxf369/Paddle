@@ -1,4 +1,4 @@
-/* Copyright (c) 2016 Baidu, Inc. All Rights Reserve.
+/* Copyright (c) 2016 PaddlePaddle Authors. All Rights Reserve.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -12,21 +12,19 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
 
-
 #pragma once
 
-#include <memory>
 #include <functional>
-#include <paddle/parameter/Argument.h>
-#include "paddle/utils/ClassRegistrar.h"
-#include "paddle/math/CpuSparseMatrix.h"
-#include "paddle/parameter/Parameter.h"
-#include "paddle/utils/Util.h"
+#include <memory>
 #include "ModelConfig.pb.h"
-
+#include "paddle/function/Function.h"
 #include "paddle/gserver/activations/ActivationFunction.h"
-#include <paddle/parameter/ParallelParameter.h>
-#include <paddle/parameter/Weight.h>
+#include "paddle/math/CpuSparseMatrix.h"
+#include "paddle/parameter/Argument.h"
+#include "paddle/parameter/Parameter.h"
+#include "paddle/parameter/Weight.h"
+#include "paddle/utils/ClassRegistrar.h"
+#include "paddle/utils/Util.h"
 
 /// Macro for registering a layer type.
 /// Example: REGISTER_LAYER(crf_error, CRFDecodingErrorLayer);
@@ -51,6 +49,12 @@ struct LayerState {
 };
 typedef std::shared_ptr<LayerState> LayerStatePtr;
 
+/// Paddle device ID, MKLDNN is -2, CPU is -1
+enum PADDLE_DEVICE_ID {
+  MKLDNN_DEVICE = -2,
+  CPU_DEVICE = -1,
+};
+
 /**
  * @brief Base class for layer.
  * Define necessary variables and functions for every layer.
@@ -61,7 +65,7 @@ protected:
   LayerConfig config_;
   /// whether to use GPU
   bool useGpu_;
-  /// Device Id. CPU is -1, and GPU is 0, 1, 2 ...
+  /// Device Id. MKLDNN is -2, CPU is -1, and GPU is 0, 1, 2 ...
   int deviceId_;
   /// Input layers
   std::vector<LayerPtr> inputLayers_;
@@ -79,8 +83,10 @@ protected:
   Argument output_;
   /// Several outputs stored on different devices, used in 'parallel_nn' case,
   /// and record them by deviceId_.
+  /// Also used in 'use_mkldnn' case.
   std::vector<Argument> outputOtherDevice_;
   /// If there are several outputs, map them by each name.
+  /// MKLDNNLayer use it only to merge output grad
   std::map<std::string, Argument*> outputMap_;
   /// Used to merge grad on different devices.
   MatrixPtr tmpGrad_;
@@ -101,23 +107,28 @@ protected:
   /// Mark input grad in(true) or out(false) of backward function.
   std::vector<bool> markInBackward_;
 
+  /// Layer forward function
+  std::vector<std::shared_ptr<FunctionBase>> forward_;
+  /// Layer backward function
+  std::vector<std::shared_ptr<FunctionBase>> backward_;
+
 public:
   /**
-    * Wait until all input value ready.
-    * Called before Layer::forward() function.
-    */
+   * Wait until all input value ready.
+   * Called before Layer::forward() function.
+   */
   virtual void waitInputValue();
 
   /**
-   * Copy layer's output_ to other device. 
+   * Copy layer's output_ to other device.
    * If output layer is in other device, called after Layer::forward() function.
    */
   virtual void copyOutputToOtherDevice();
 
   /**
-    * Wait until all output grad ready and merge them to output_.grad.
-    * Called before Layer::backward() function.
-    */
+   * Wait until all output grad ready and merge them to output_.grad.
+   * Called before Layer::backward() function.
+   */
   virtual void waitAndMergeOutputGrad();
 
   /**
@@ -127,6 +138,26 @@ public:
   virtual void markAllInputGrad();
 
 protected:
+  /**
+   * Create layer function. Function is called in forward or backward.
+   * \param function, Layer::forward_ or Layer::backward_
+   * \param name, function name
+   * \param config, initialization configuration for the function
+   */
+  void createFunction(std::vector<std::shared_ptr<FunctionBase>>& function,
+                      const std::string& name,
+                      const FuncConfig& config) {
+    if (useGpu_) {
+      function.emplace_back(
+          FunctionBase::funcRegistrar_.createByType(name + "-GPU"));
+    } else {
+      function.emplace_back(
+          FunctionBase::funcRegistrar_.createByType(name + "-CPU"));
+    }
+    auto& func = function.back();
+    func->init(config);
+  }
+
   /**
    * Notify specified layer the output grad ready.
    * Called in the backward function.
@@ -150,6 +181,13 @@ protected:
   }
 
   /**
+   * Get the argument of input layer with deviceId.
+   */
+  const Argument& getInput(size_t inputIndex, int deviceId) const {
+    return inputLayers_[inputIndex]->getOutput(deviceId);
+  }
+
+  /**
    * Get the forward-input value.
    */
   const MatrixPtr& getInputValue(int inputIndex) {
@@ -161,6 +199,13 @@ protected:
    */
   const MatrixPtr& getInputValue(const Layer& inputLayer) {
     return inputLayer.getOutput(deviceId_).value;
+  }
+
+  /**
+   * Get the forward-input value with deviceId.
+   */
+  const MatrixPtr& getInputValue(int inputIndex, int deviceId) {
+    return inputLayers_[inputIndex]->getOutput(deviceId).value;
   }
 
   /**
@@ -178,6 +223,13 @@ protected:
   }
 
   /**
+   * Get the forward-input grad.
+   */
+  const MatrixPtr& getInputGrad(int inputIndex, int deviceId) {
+    return inputLayers_[inputIndex]->getOutput(deviceId).grad;
+  }
+
+  /**
    * Get the forward-input label.
    */
   const IVectorPtr& getInputLabel(const Layer& inputLayer) {
@@ -189,8 +241,11 @@ protected:
    * Reset to value zero if isValueClean = true,
    * Reset to grad zero if isGradClean = true.
    */
-  void resetSpecifyOutput(Argument& output, size_t height, size_t width,
-                          bool isValueClean, bool isGradClean);
+  void resetSpecifyOutput(Argument& output,
+                          size_t height,
+                          size_t width,
+                          bool isValueClean,
+                          bool isGradClean);
 
   /**
    * Add output argument to other devices.
@@ -204,48 +259,48 @@ public:
   /// Register a Layer
   static ClassRegistrar<Layer, LayerConfig> registrar_;
 
-  /** 
+  /**
    * Get the flag whether layer need to compute gradient.
    */
   bool needGradient() const { return needGradient_; }
 
-  /** 
+  /**
    * Set the flag whether layer need to compute gradient.
    */
   void setNeedGradient(bool need) { needGradient_ = need; }
 
-  /** 
+  /**
    * Set the flag whether layer need to re-compute sequence information,
    * which includes sequenceStartPositions or subSequenceStartPositions.
    */
   void setNeedSequenceInfo(bool need) { needSequenceInfo_ = need; }
 
-  /** 
+  /**
    * Get layer's name.
    */
   const std::string& getName() const { return config_.name(); }
 
-  /** 
+  /**
    * Get layer's type.
    */
   const std::string& getType() const { return config_.type(); }
 
-  /** 
+  /**
    * Get layer's size.
    */
   size_t getSize() const { return config_.size(); }
 
-  /** 
+  /**
    * Get layer's deviceId.
    */
   int getDeviceId() const { return deviceId_; }
 
-  /** 
+  /**
    * Add the inputLayer.
    */
   void addPrev(LayerPtr l) { inputLayers_.push_back(l); }
 
-  /** 
+  /**
    * Get the size of inputLayer[i].
    */
   const LayerPtr& getPrev(size_t i) { return inputLayers_[i]; }
@@ -265,11 +320,16 @@ public:
    */
   const MatrixPtr& getOutputGrad() { return output_.grad; }
   /**
-   * If layer has multi-output, set output into outputMap_. 
+   * If layer has multi-output, set output into outputMap_.
    */
   void setOutput(const std::string& name, Argument* output) {
     outputMap_[name] = output;
   }
+
+  /**
+   * Get the output map size, if layer has multi-output.
+   */
+  size_t getOutputMapSize() { return outputMap_.size(); }
 
   /**
    * Get the output based on layer's name.
@@ -283,6 +343,7 @@ public:
         return *output->second;
       } else {
         LOG(FATAL) << "No specific output " << str;
+        return *((Argument*)nullptr);
       }
     }
   }
@@ -351,8 +412,8 @@ public:
   /**
    * Intialization for sub network if there has sub network.
    * @param rootNetwork root network
-   * @param config model config 
-   * @param parameterTypes parameter's type 
+   * @param config model config
+   * @param parameterTypes parameter's type
    * @param useGpu whether to use gpu or not
    */
   virtual void initSubNetwork(NeuralNetwork* rootNetwork,
@@ -391,7 +452,8 @@ public:
   /**
    * Reset the internal state variables.
    * Allocate them if they have not been allocated.
-   * This function need to called before Layer::forward() for generating sequence.
+   * This function need to called before Layer::forward() for generating
+   * sequence.
    *
    * This is used for sequence generation. When generating sequence, the
    * calculation at current timestamp depends on the state from previous
@@ -407,7 +469,7 @@ public:
   virtual void setState(LayerStatePtr state) {}
 
   /**
-   * Get layer state. 
+   * Get layer state.
    * @return A copy of internal state.
    */
   virtual LayerStatePtr getState() { return nullptr; }

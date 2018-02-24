@@ -1,4 +1,4 @@
-/* Copyright (c) 2016 Baidu, Inc. All Rights Reserve.
+/* Copyright (c) 2016 PaddlePaddle Authors. All Rights Reserve.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -12,198 +12,197 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
 
-
+#include "ExpandConvLayer.h"
 #include "paddle/utils/Logging.h"
 #include "paddle/utils/Stat.h"
-#include "ExpandConvLayer.h"
+
+DEFINE_bool(use_nnpack,
+            false,
+            "Whether to use nnpack for convolution calculation.");
 
 namespace paddle {
 
+/*
+ * The calculation of the exconvt(convolution transpose (deconv) operation)
+ * is a swap of forward and backward of the calculation of exconv.
+ * */
 REGISTER_LAYER(exconv, ExpandConvLayer);
+REGISTER_LAYER(exconvt, ExpandConvLayer);
+
+inline bool isDepthwiseConv(int channels, int groups) {
+  return channels == groups;
+}
 
 bool ExpandConvLayer::init(const LayerMap &layerMap,
                            const ParameterMap &parameterMap) {
   /* Initialize the basic convolutional parent class */
   ConvBaseLayer::init(layerMap, parameterMap);
 
-  /* Initialize the projection */
+  int index = 0;
   for (auto &inputConfig : config_.inputs()) {
     const ConvConfig &conf = inputConfig.conv_conf();
-    subM_.push_back(numFilters_ / conf.groups());
-    subN_.push_back(conf.output_x() * conf.output_x());
-    subK_.push_back(conf.channels() * conf.filter_size() * conf.filter_size() /
-                    conf.groups());
     /* Consistent caffe mode for multiple input */
     caffeMode_ = conf.caffe_mode();
+
+    // create a new weight
+    size_t height, width;
+    height = filterPixels_[index] * filterChannels_[index];
+    width = (!isDeconv_) ? numFilters_ : channels_[index];
+    CHECK_EQ(parameters_[index]->getSize(), width * height);
+    Weight *w = new Weight(height, width, parameters_[index]);
+    weights_.emplace_back(w);
+    index++;
   }
 
+  if (biasParameter_.get()) {
+    if (sharedBiases_) {
+      CHECK_EQ((size_t)numFilters_, biasParameter_->getSize());
+      biases_ = std::unique_ptr<Weight>(
+          new Weight(1, numFilters_, biasParameter_, 0));
+    } else {
+      biases_ =
+          std::unique_ptr<Weight>(new Weight(1, getSize(), biasParameter_, 0));
+    }
+  }
+
+  getOutputSize();
+
+  size_t numInputs = config_.inputs_size();
+  inputShape_.resize(numInputs);
+  filterShape_.resize(numInputs);
+  outputShape_.resize(numInputs);
+
+  std::string convType;
+  std::string convGradInputType;
+  std::string convGradFilterType;
+
+  for (int i = 0; i < config_.inputs_size(); i++) {
+    std::vector<size_t> paddings = {(size_t)paddingY_[i], (size_t)padding_[i]};
+    std::vector<size_t> strides = {(size_t)strideY_[i], (size_t)stride_[i]};
+    std::vector<size_t> dilations = {(size_t)dilationY_[i],
+                                     (size_t)dilation_[i]};
+
+    bool useDilation = ((size_t)dilationY_[i] > 1 || (size_t)dilation_[i] > 1);
+
+    // Convolution Layer uses the GemmConv function by default.
+    convType = "GemmConv";
+    convGradInputType = "GemmConvGradInput";
+    convGradFilterType = "GemmConvGradFilter";
+
+    // If depth wise convolution and useGpu == true
+    if (useGpu_ && isDepthwiseConv(channels_[i], groups_[i]) && !isDeconv_) {
+      convType = "DepthwiseConv";
+      convGradInputType = "DepthwiseConvGradInput";
+      convGradFilterType = "DepthwiseConvGradFilter";
+    }
+
+    // If depth wise convolution and useGpu == false and ARM-NEON
+    if (!useGpu_ && isDepthwiseConv(channels_[i], groups_[i]) && !isDeconv_) {
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
+      if ((filterSize_[i] == filterSizeY_[i]) &&
+          (filterSize_[i] == 3 || filterSize_[i] == 4) &&
+          (stride_[i] == strideY_[i]) && (stride_[i] == 1 || stride_[i] == 2) &&
+          !useDilation) {
+        convType = "NeonDepthwiseConv";
+      }
+#endif
+    }
+
+    if (FLAGS_use_nnpack && !isDeconv_ && !useDilation) {
+      createFunction(forward_,
+                     "NNPACKConv",
+                     FuncConfig()
+                         .set("paddings", paddings)
+                         .set("strides", strides)
+                         .set("groups", (size_t)groups_[i])
+                         .set("algo", std::string("auto")));
+    } else {
+      createFunction(forward_,
+                     !isDeconv_ ? convType : convGradInputType,
+                     FuncConfig()
+                         .set("paddings", paddings)
+                         .set("strides", strides)
+                         .set("dilations", dilations)
+                         .set("groups", (size_t)groups_[i]));
+
+      createFunction(backward_,
+                     !isDeconv_ ? convGradInputType : convType,
+                     FuncConfig()
+                         .set("paddings", paddings)
+                         .set("strides", strides)
+                         .set("dilations", dilations)
+                         .set("groups", (size_t)groups_[i]));
+
+      createFunction(backward_,
+                     convGradFilterType,
+                     FuncConfig()
+                         .set("paddings", paddings)
+                         .set("strides", strides)
+                         .set("dilations", dilations)
+                         .set("groups", (size_t)groups_[i]));
+    }
+  }
   return true;
 }
 
-size_t ExpandConvLayer::getSize() {
+size_t ExpandConvLayer::getOutputSize() {
   CHECK_NE(inputLayers_.size(), 0UL);
-  imgSizeH_.clear();
-  imgSizeW_.clear();
-  outputH_.clear();
-  outputW_.clear();
-  subN_.clear();
-  size_t layerSize = 0;
-  for (size_t i = 0; i < inputLayers_.size(); i++) {
-    imgSizeH_.push_back(inputLayers_[i]->getOutput().getFrameHeight());
-    imgSizeW_.push_back(inputLayers_[i]->getOutput().getFrameWidth());
-    if (imgSizeH_[i] == 0) imgSizeH_[i] = imgSize_[i];
-    if (imgSizeW_[i] == 0) imgSizeW_[i] = imgSize_[i];
-    outputH_.push_back(
-        outputSize(imgSizeH_[i], filterSize_[i], padding_[i], stride_[i]));
-    outputW_.push_back(
-        outputSize(imgSizeW_[i], filterSize_[i], padding_[i], stride_[i]));
-    subN_.push_back(outputH_[i] * outputW_[i]);
-    CHECK(layerSize == 0 || subN_[i] * size_t(numFilters_) == layerSize);
-    layerSize = subN_[i] * numFilters_;
-  }
-  getOutput().setFrameHeight(outputH_[0]);
-  getOutput().setFrameWidth(outputW_[0]);
+  size_t layerSize = ConvBaseLayer::calOutputSize();
   return layerSize;
 }
 
-void ExpandConvLayer::resetExpandInput(size_t height, size_t width) {
-  Matrix::resizeOrCreate(expandInput_, height, width, false, useGpu_);
-}
-
-void ExpandConvLayer::resetConvOutput(size_t batchSize, int inIdx) {
-  Matrix::resizeOrCreate(transOutValue_, batchSize * numFilters_, subN_[inIdx],
-                         false, useGpu_);
-}
-
-void ExpandConvLayer::expandOneFrame(MatrixPtr image, size_t startIdx,
-                                     int inIdx) {
-  resetExpandInput(subK_[inIdx] * groups_[inIdx], subN_[inIdx]);
-  real *imgData = image->getData() + startIdx * image->getWidth();
-  MatrixPtr imageTmp = Matrix::create(
-      imgData, 1, imgSizeH_[inIdx] * imgSizeW_[inIdx] * channels_[inIdx], false,
-      useGpu_);
-  expandInput_->convExpand(*imageTmp, imgSizeH_[inIdx], imgSizeW_[inIdx],
-                           channels_[inIdx], filterSize_[inIdx],
-                           filterSize_[inIdx], stride_[inIdx], stride_[inIdx],
-                           padding_[inIdx], padding_[inIdx],
-                           outputH_[inIdx], outputW_[inIdx]);
-  imageTmp->clear();
-}
-
-void ExpandConvLayer::expandFwdOnce(MatrixPtr image, int inIdx, int startIdx) {
-  int subM = subM_[inIdx];
-  int subN = subN_[inIdx];
-  int subK = subK_[inIdx];
-
-  expandOneFrame(image, startIdx, inIdx);
-
-  real *outData =
-      getOutputValue()->getData() + startIdx * subN * numFilters_;
-
-  real *wgtData = weights_[inIdx]->getW()->getData();
-  real *expInData = expandInput_->getData();
-  for (int g = 0; g < groups_[inIdx]; ++g) {
-    MatrixPtr A =
-        Matrix::create(wgtData, subK, subM, true, useGpu_);  // mark transpose
-    MatrixPtr B = Matrix::create(expInData, subK, subN, false, useGpu_);
-    MatrixPtr C = Matrix::create(outData, subM, subN, false, useGpu_);
-    C->mul(A, B, 1, 1);
-
-    A->clear();
-    B->clear();
-    C->clear();
-    wgtData += subK * subM;
-    expInData += subK * subN;
-    outData += subM * subN;
-  }
-}
-
-void ExpandConvLayer::addSharedBias() {
-  size_t mapW = getSize() / numFilters_;
-  size_t mapH = getOutputValue()->getElementCnt() / mapW;
-  MatrixPtr out =
-      Matrix::create(getOutputValue()->getData(), mapH, mapW, false, useGpu_);
-
-  Matrix::resizeOrCreate(transOutValue_, mapW, mapH, false, useGpu_);
-
-  out->transpose(transOutValue_, false);  // false means no memory allocation
-  transOutValue_->reshape(transOutValue_->getElementCnt() / numFilters_,
-                          numFilters_);
-
-  MatrixPtr bias =
-      Matrix::create(biases_->getW()->getData(), 1,
-                     biases_->getW()->getElementCnt(), false, useGpu_);
-  transOutValue_->addBias(*bias, 1.0f);
-
-  transOutValue_->reshape(mapW, mapH);
-  transOutValue_->transpose(out, false);  // false means no memory allocation
-
-  out->clear();
-  bias->clear();
-}
-
-void ExpandConvLayer::addUnsharedBias() {
-  MatrixPtr outValue = getOutputValue();
-  MatrixPtr bias =
-      Matrix::create(biases_->getW()->getData(), 1,
-                     biases_->getW()->getElementCnt(), false, useGpu_);
-  outValue->addBias(*bias, 1.0f);
-}
+// i is the index of input layers
+#define BACKWARD_INPUT(i, inputs, outputs) \
+  backward_[2 * i]->calc(inputs, outputs)
+#define BACKWARD_FILTER(i, inputs, outputs) \
+  backward_[2 * i + 1]->calc(inputs, outputs)
 
 void ExpandConvLayer::forward(PassType passType) {
   Layer::forward(passType);
 
-  /* malloc memory for the output_ if necessary */
-  /* note: one sample correspond to one colum, and the
-   *   transOutValue correspond sample to one row */
-  int batchSize = inputLayers_[0]->getOutputValue()->getWidth();
-  batchSize = inputLayers_[0]->getOutputValue()->getHeight();
-  resetOutput(batchSize, getSize());
+  size_t batchSize = inputLayers_[0]->getOutputValue()->getHeight();
+  resetOutput(batchSize, getOutputSize());
 
-  MatrixPtr image = nullptr;
-  for (size_t i = 0; i != inputLayers_.size(); ++i) {
-    LayerPtr prevLayer = getPrev(i);
-    image = prevLayer->getOutputValue();
-    for (size_t off = 0; off < image->getHeight(); off++) {
-      REGISTER_TIMER_INFO("expandFwdOnce", getName().c_str());
-      expandFwdOnce(image, i, off);
-    }
+  // Calculate the shape of the input, output, and filter.
+  for (size_t i = 0; i < inputLayers_.size(); ++i) {
+    inputShape_[i] = TensorShape({(size_t)batchSize,
+                                  (size_t)channels_[i],
+                                  (size_t)imgSizeH_[i],
+                                  (size_t)imgSizeW_[i]});
+    filterShape_[i] =
+        TensorShape({(size_t)groups_[i],
+                     !isDeconv_ ? (size_t)numFilters_ / groups_[i]
+                                : (size_t)channels_[i] / groups_[i],
+                     !isDeconv_ ? (size_t)channels_[i] / groups_[i]
+                                : (size_t)numFilters_ / groups_[i],
+                     (size_t)filterSizeY_[i],
+                     (size_t)filterSize_[i]});
+    outputShape_[i] = TensorShape({(size_t)batchSize,
+                                   (size_t)numFilters_,
+                                   (size_t)outputH_[i],
+                                   (size_t)outputW_[i]});
   }
+
+  // Calculate the output value.
+  for (size_t i = 0; i < inputLayers_.size(); ++i) {
+    BufferArgs inputs;
+    BufferArgs outputs;
+    inputs.addArg(*getInputValue(i), inputShape_[i]);
+    inputs.addArg(*weights_[i]->getW(), filterShape_[i]);
+    outputs.addArg(*getOutputValue(),
+                   outputShape_[i],
+                   !isDeconv_ && i == 0 ? ASSIGN_TO : ADD_TO);
+
+    forward_[i]->calc(inputs, outputs);
+  }
+
   /* add the bias-vector */
-  if (biases_.get() != NULL) {
-    if (sharedBiases_) {
-      addSharedBias();
-    } else {
-      addUnsharedBias();
-    }
+  if (biases_.get()) {
+    output_.value->addBias(*biases_->getW(), 1.0, sharedBiases_);
   }
 
   /* activation */
   forwardActivation();
-}
-
-void ExpandConvLayer::bpropSharedBias(MatrixPtr biases, MatrixPtr v) {
-  size_t mapW = getSize() / numFilters_;
-  size_t mapH = v->getElementCnt() / mapW;
-  MatrixPtr vTmp = Matrix::create(v->getData(), mapH, mapW, false, useGpu_);
-
-  Matrix::resizeOrCreate(transOutValue_, mapW, mapH, false, useGpu_);
-
-  vTmp->transpose(transOutValue_, false);  // false means no memory allocation
-  vTmp->reshape(transOutValue_->getElementCnt() / numFilters_, numFilters_);
-  biases->collectBias(*vTmp, 1.0f);
-}
-
-void ExpandConvLayer::bpropBiases(MatrixPtr v) {
-  MatrixPtr biases =
-      Matrix::create(biases_->getWGrad()->getData(), 1,
-                     biases_->getWGrad()->getElementCnt(), false, useGpu_);
-  if (sharedBiases_) {
-    bpropSharedBias(biases, v);
-  } else {
-    biases->collectBias(*v, 1.0f);
-  }
-  biases->clear();
 }
 
 void ExpandConvLayer::backward(const UpdateCallback &callback) {
@@ -211,115 +210,38 @@ void ExpandConvLayer::backward(const UpdateCallback &callback) {
 
   MatrixPtr outGrad = getOutputGrad();
   if (biases_ && biases_->getWGrad()) {
-    bpropBiases(outGrad);
+    biases_->getWGrad()->collectBias(*getOutputGrad(), 1, sharedBiases_);
     /* Increasing the number of gradient */
     biases_->getParameterPtr()->incUpdate(callback);
   }
 
-  for (size_t i = 0; i != inputLayers_.size(); ++i) {
-    /* First, calculate the input layers error */
-    bpropActs(outGrad, i);
+  // Calculate the input grad and filter grad.
+  for (size_t i = 0; i < inputLayers_.size(); ++i) {
+    if (getInputGrad(i)) {
+      BufferArgs inputs;
+      BufferArgs outputs;
+      inputs.addArg(*getOutputGrad(), outputShape_[i]);
+      inputs.addArg(*weights_[i]->getW(), filterShape_[i]);
+      outputs.addArg(*getInputGrad(i), inputShape_[i], ADD_TO);
+      BACKWARD_INPUT(i, inputs, outputs);
+    }
+
     if (weights_[i]->getWGrad()) {
-      /* Then, calculate the W-gradient for the current layer */
-      bpropWeights(outGrad, i);
+      BufferArgs inputs;
+      BufferArgs outputs;
+      if (!isDeconv_) {
+        inputs.addArg(*getOutputGrad(), outputShape_[i]);
+        inputs.addArg(*getInputValue(i), inputShape_[i]);
+      } else {
+        inputs.addArg(*getInputValue(i), inputShape_[i]);
+        inputs.addArg(*getOutputGrad(), outputShape_[i]);
+      }
+      outputs.addArg(*weights_[i]->getWGrad(), filterShape_[i], ADD_TO);
+      BACKWARD_FILTER(i, inputs, outputs);
+
       /* Increasing the number of gradient */
       weights_[i]->getParameterPtr()->incUpdate(callback);
     }
-  }
-}
-
-void ExpandConvLayer::bpropWeights(MatrixPtr v, int inpIdx) {
-  MatrixPtr weightGrad = weights_[inpIdx]->getWGrad();
-  MatrixPtr inputV = getPrev(inpIdx)->getOutputValue();
-
-  int subM = subM_[inpIdx];
-  int subN = subN_[inpIdx];
-  int subK = subK_[inpIdx];
-  size_t batchSize = inputV->getHeight();
-  resetExpandInput(subK * groups_[inpIdx], subN);
-  resetConvOutput(batchSize, inpIdx);
-
-  real *gradData = v->getData();
-
-  for (size_t n = 0; n < batchSize; n++) {  // frame by frame
-    // expand
-    expandOneFrame(inputV, n, inpIdx);
-    real *wGradData = weightGrad->getData();
-    real *expandInData = expandInput_->getData();
-
-    // expand-mul one-group by one
-    for (int g = 0; g < groups_[inpIdx]; g++) {
-      MatrixPtr A = Matrix::create(expandInData, subK, subN, false, useGpu_);
-      MatrixPtr B = Matrix::create(gradData, subM, subN, true, useGpu_);
-      MatrixPtr C = Matrix::create(wGradData, subK, subM, false, useGpu_);
-      C->mul(A, B, 1, 1);
-
-      A->clear();
-      B->clear();
-      C->clear();
-      gradData += subM * subN;
-      wGradData += subK * subM;
-      expandInData += subK * subN;
-    }
-  }
-}
-
-void ExpandConvLayer::bpropActs(MatrixPtr v, int inpIdx) {
-  LayerPtr prevLayer = getPrev(inpIdx);
-  if (NULL == prevLayer->getOutputGrad()) {
-    return;
-  }
-
-  int subM = subM_[inpIdx];
-  int subN = subN_[inpIdx];
-  int subK = subK_[inpIdx];
-  size_t batchSize = v->getHeight();
-  MatrixPtr tgtGrad = prevLayer->getOutputGrad();
-
-  /* reset the expand-grad memory */
-  resetExpandInput(subK * groups_[inpIdx], subN);
-  resetConvOutput(batchSize, inpIdx);
-
-  real *localGradData = v->getData();
-  real *tgtGradData = tgtGrad->getData();
-  for (size_t n = 0; n < batchSize; n++) {
-    real *wgtData = weights_[inpIdx]->getW()->getData();
-    real *expandInData = expandInput_->getData();
-
-    for (int g = 0; g < groups_[inpIdx]; g++) {
-      // create temporary matrix
-      MatrixPtr C = Matrix::create(expandInData, subK, subN, false, useGpu_);
-      MatrixPtr B = Matrix::create(localGradData, subM, subN, false, useGpu_);
-      MatrixPtr A = Matrix::create(wgtData, subK, subM, false, useGpu_);
-      C->mul(A, B);  // mul
-
-      // clear the temporary matrix
-      A->clear();
-      B->clear();
-      C->clear();
-
-      expandInData += subK * subN;
-      localGradData += subM * subN;
-      wgtData += subK * subM;
-    }
-
-    // shrink one frame outGrad
-    MatrixPtr oneGradTmp = Matrix::create(
-        expandInput_->getData(), subK * groups_[inpIdx], subN, false, useGpu_);
-    MatrixPtr vTmp = Matrix::create(
-        tgtGradData, 1,
-        imgSizeH_[inpIdx] * imgSizeW_[inpIdx] * channels_[inpIdx], false,
-        useGpu_);
-    vTmp->convShrink(*oneGradTmp, imgSizeH_[inpIdx], imgSizeW_[inpIdx],
-                     channels_[inpIdx], filterSize_[inpIdx],
-                     filterSize_[inpIdx], stride_[inpIdx], stride_[inpIdx],
-                     padding_[inpIdx], padding_[inpIdx],
-                     outputH_[inpIdx], outputW_[inpIdx], 1.0f, 1.0f);
-    vTmp->clear();
-    oneGradTmp->clear();
-
-    // move the data-pointer
-    tgtGradData += imgSizeH_[inpIdx] * imgSizeW_[inpIdx] * channels_[inpIdx];
   }
 }
 

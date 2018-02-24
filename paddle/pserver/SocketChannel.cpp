@@ -1,4 +1,4 @@
-/* Copyright (c) 2016 Baidu, Inc. All Rights Reserve.
+/* Copyright (c) 2016 PaddlePaddle Authors. All Rights Reserve.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -12,20 +12,27 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
 
-
 #include "SocketChannel.h"
 
-#include <stdio.h>
-#include <sys/types.h>
-#include <sys/socket.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <stdio.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include "RDMANetwork.h"
 
 #include "paddle/utils/Util.h"
 
 namespace paddle {
+
+/**
+ * UIO_MAXIOV is documented in writev(2), but <sys/uio.h> only
+ * declares it on osx/ios if defined(KERNEL)
+ */
+#ifndef UIO_MAXIOV
+#define UIO_MAXIOV 512
+#endif
 
 SocketChannel::~SocketChannel() {
   if (tcpRdma_ == F_TCP)
@@ -44,7 +51,7 @@ size_t SocketChannel::read(void* buf, size_t size) {
     else
       len = rdma::read(rdmaSocket_, (char*)buf + total, size - total);
 
-    PCHECK(len >= 0) << " peer=" << peerName_;
+    CHECK(len >= 0) << " peer=" << peerName_;
     if (len <= 0) {
       return total;
     }
@@ -62,7 +69,7 @@ size_t SocketChannel::write(const void* buf, size_t size) {
     else
       len = rdma::write(rdmaSocket_, (char*)buf + total, size - total);
 
-    PCHECK(len >= 0) << " peer=" << peerName_;
+    CHECK(len >= 0) << " peer=" << peerName_;
     if (len <= 0) {
       return total;
     }
@@ -72,8 +79,12 @@ size_t SocketChannel::write(const void* buf, size_t size) {
 }
 
 template <class IOFunc, class SocketType>
-static size_t readwritev(IOFunc iofunc, SocketType socket, iovec* iovs,
-                         int iovcnt, int maxiovs, const std::string& peerName) {
+static size_t readwritev(IOFunc iofunc,
+                         SocketType socket,
+                         iovec* iovs,
+                         int iovcnt,
+                         int maxiovs,
+                         const std::string& peerName) {
   int curIov = 0;
   size_t total = 0;
 
@@ -87,10 +98,10 @@ static size_t readwritev(IOFunc iofunc, SocketType socket, iovec* iovs,
   while (size < total) {
     ssize_t len =
         iofunc(socket, &iovs[curIov], std::min(iovcnt - curIov, maxiovs));
-    PCHECK(len > 0) << " peer=" << peerName << " curIov=" << curIov
-                    << " iovCnt=" << iovcnt
-                    << " iovs[curIov].base=" << iovs[curIov].iov_base
-                    << " iovs[curIov].iov_len=" << iovs[curIov].iov_len;
+    CHECK(len > 0) << " peer=" << peerName << " curIov=" << curIov
+                   << " iovCnt=" << iovcnt
+                   << " iovs[curIov].base=" << iovs[curIov].iov_base
+                   << " iovs[curIov].iov_len=" << iovs[curIov].iov_len;
     size += len;
 
     /// restore iovs[curIov] to the original value
@@ -114,25 +125,40 @@ static size_t readwritev(IOFunc iofunc, SocketType socket, iovec* iovs,
   return size;
 }
 
-
 /// rdma::readv and rdma::writev can take advantage of RDMA blocking offload
 /// transfering
 size_t SocketChannel::writev(const std::vector<struct iovec>& iovs) {
   if (tcpRdma_ == F_TCP)
-    return readwritev(::writev, tcpSocket_, const_cast<iovec*>(&iovs[0]),
-                      iovs.size(), UIO_MAXIOV, peerName_);
+    return readwritev(::writev,
+                      tcpSocket_,
+                      const_cast<iovec*>(&iovs[0]),
+                      iovs.size(),
+                      UIO_MAXIOV,
+                      peerName_);
   else
-    return readwritev(rdma::writev, rdmaSocket_, const_cast<iovec*>(&iovs[0]),
-                      iovs.size(), MAX_VEC_SIZE, peerName_);
+    return readwritev(rdma::writev,
+                      rdmaSocket_,
+                      const_cast<iovec*>(&iovs[0]),
+                      iovs.size(),
+                      MAX_VEC_SIZE,
+                      peerName_);
 }
 
 size_t SocketChannel::readv(std::vector<struct iovec>* iovs) {
   if (tcpRdma_ == F_TCP)
-    return readwritev(::readv, tcpSocket_, const_cast<iovec*>(&(*iovs)[0]),
-                      iovs->size(), UIO_MAXIOV, peerName_);
+    return readwritev(::readv,
+                      tcpSocket_,
+                      const_cast<iovec*>(&(*iovs)[0]),
+                      iovs->size(),
+                      UIO_MAXIOV,
+                      peerName_);
   else
-    return readwritev(rdma::readv, rdmaSocket_, const_cast<iovec*>(&(*iovs)[0]),
-                      iovs->size(), MAX_VEC_SIZE, peerName_);
+    return readwritev(rdma::readv,
+                      rdmaSocket_,
+                      const_cast<iovec*>(&(*iovs)[0]),
+                      iovs->size(),
+                      MAX_VEC_SIZE,
+                      peerName_);
 }
 
 void SocketChannel::writeMessage(const std::vector<struct iovec>& userIovs) {
@@ -148,7 +174,8 @@ void SocketChannel::writeMessage(const std::vector<struct iovec>& userIovs) {
   std::vector<iovec> iovs;
   iovs.reserve(userIovs.size() + 2);
   iovs.push_back({&header, sizeof(header)});
-  iovs.push_back({&iovLengths[0], sizeof(iovLengths[0]) * header.numIovs});
+  iovs.push_back({&iovLengths[0],
+                  static_cast<size_t>(sizeof(iovLengths[0]) * header.numIovs)});
   iovs.insert(iovs.end(), userIovs.begin(), userIovs.end());
 
   header.totalLength = 0;
@@ -156,7 +183,7 @@ void SocketChannel::writeMessage(const std::vector<struct iovec>& userIovs) {
     header.totalLength += iov.iov_len;
   }
 
-  PCHECK(writev(iovs) == (size_t)header.totalLength);
+  CHECK(writev(iovs) == (size_t)header.totalLength);
 }
 
 std::unique_ptr<MsgReader> SocketChannel::readMessage() {
@@ -167,7 +194,7 @@ std::unique_ptr<MsgReader> SocketChannel::readMessage() {
     return nullptr;
   }
 
-  PCHECK(len == sizeof(header));
+  CHECK(len == sizeof(header));
 
   std::unique_ptr<MsgReader> msgReader(new MsgReader(this, header.numIovs));
 
@@ -182,7 +209,7 @@ std::unique_ptr<MsgReader> SocketChannel::readMessage() {
 MsgReader::MsgReader(SocketChannel* channel, size_t numBlocks)
     : channel_(channel), blockLengths_(numBlocks), currentBlockIndex_(0) {
   size_t size = numBlocks * sizeof(blockLengths_[0]);
-  PCHECK(channel_->read(&blockLengths_[0], size) == size);
+  CHECK(channel_->read(&blockLengths_[0], size) == size);
 }
 
 void MsgReader::readBlocks(const std::vector<void*>& bufs) {
@@ -196,12 +223,12 @@ void MsgReader::readBlocks(const std::vector<void*>& bufs) {
     ++currentBlockIndex_;
   }
 
-  PCHECK(channel_->readv(&iovs) == totalLength);
+  CHECK(channel_->readv(&iovs) == totalLength);
 }
 
 void MsgReader::readNextBlock(void* buf) {
   CHECK_LT(currentBlockIndex_, blockLengths_.size());
-  PCHECK(channel_->read(buf, getNextBlockLength()) == getNextBlockLength());
+  CHECK(channel_->read(buf, getNextBlockLength()) == getNextBlockLength());
   ++currentBlockIndex_;
 }
 

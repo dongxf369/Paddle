@@ -1,4 +1,4 @@
-/* Copyright (c) 2016 Baidu, Inc. All Rights Reserve.
+/* Copyright (c) 2016 PaddlePaddle Authors. All Rights Reserve.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -12,20 +12,20 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
 
-
 #include <gtest/gtest.h>
-#include "paddle/utils/Util.h"
 #include "paddle/utils/Logging.h"
+#include "paddle/utils/Util.h"
 #define private public
-#include "paddle/math/MemoryHandle.h"
 #include "paddle/math/Allocator.h"
+#include "paddle/math/MemoryHandle.h"
 #include "paddle/math/PoolAllocator.h"
 
-using namespace paddle;     // NOLINT
+using namespace paddle;  // NOLINT
 
-template<typename Allocator>
+template <typename Allocator>
 void testPoolAllocator() {
-  PoolAllocator* pool = new PoolAllocator(new Allocator(), /* sizeLimit */1024);
+  PoolAllocator* pool =
+      new PoolAllocator(new Allocator(), /* sizeLimit */ 1024);
 
   /* alloc from system memory */
   void* ptr1 = pool->alloc(10);
@@ -68,7 +68,7 @@ void testPoolAllocator() {
 
 TEST(Allocator, Pool) {
   testPoolAllocator<CpuAllocator>();
-#ifndef PADDLE_ONLY_CPU
+#ifdef PADDLE_WITH_CUDA
   testPoolAllocator<GpuAllocator>();
 #endif
 }
@@ -92,7 +92,7 @@ TEST(MemoryHandle, Cpu) {
   EXPECT_EQ(ptr1, ptr2);
 }
 
-#ifndef PADDLE_ONLY_CPU
+#ifdef PADDLE_WITH_CUDA
 TEST(MemoryHandle, Gpu) {
   int numGpu = hl_get_device_count();
 
@@ -120,9 +120,3 @@ TEST(MemoryHandle, Gpu) {
   }
 }
 #endif
-
-int main(int argc, char** argv) {
-  testing::InitGoogleTest(&argc, argv);
-  initMain(argc, argv);
-  return RUN_ALL_TESTS();
-}

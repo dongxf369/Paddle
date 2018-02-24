@@ -1,4 +1,4 @@
-/* Copyright (c) 2016 Baidu, Inc. All Rights Reserve.
+/* Copyright (c) 2016 PaddlePaddle Authors. All Rights Reserve.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -12,12 +12,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
 
-
-#include "paddle/utils/Stat.h"
-#include "Layer.h"
 #include "BatchNormBaseLayer.h"
 #include "BatchNormalizationLayer.h"
-#ifndef PADDLE_ONLY_CPU
+#include "Layer.h"
+#include "paddle/utils/Stat.h"
+#ifdef PADDLE_WITH_CUDA
 #include "CudnnBatchNormLayer.h"
 #endif
 
@@ -42,6 +41,7 @@ bool BatchNormBaseLayer::init(const LayerMap& layerMap,
     useGlobalStats_ = config_.use_global_stats();
   }
   movingAvgFraction_ = config_.moving_average_fraction();
+  epsilon_ = config_.epsilon();
 
   weight_.reset(new Weight(1, channels_, parameters_[0]));
   movingMean_.reset(new Weight(1, channels_, parameters_[1]));
@@ -61,18 +61,20 @@ bool BatchNormBaseLayer::init(const LayerMap& layerMap,
 
 void BatchNormBaseLayer::calFeatureMapSize() {
   const ImageConfig& conf = config_.inputs(0).image_conf();
-  if (inputLayers_[0]->getOutput().getFrameHeight() == 0 &&
-      inputLayers_[0]->getOutput().getFrameWidth() == 0) {
-    imgSize_ = conf.img_size();
-    imageH_ = imgSize_;
-    imageW_ = imgSize_;
+  imageH_ = inputLayers_[0]->getOutput().getFrameHeight();
+  imageW_ = inputLayers_[0]->getOutput().getFrameWidth();
+  imageD_ = inputLayers_[0]->getOutput().getFrameDepth();
+
+  if (0 == imageD_) imageD_ = conf.img_size_z();
+  if (imageH_ == 0 && imageW_ == 0) {
+    imageH_ = conf.has_img_size_y() ? conf.img_size_y() : conf.img_size();
+    imageW_ = conf.img_size();
   } else {
-    imageH_ = inputLayers_[0]->getOutput().getFrameHeight();
-    imageW_ = inputLayers_[0]->getOutput().getFrameWidth();
+    getOutput().setFrameHeight(imageH_);
+    getOutput().setFrameWidth(imageW_);
+    getOutput().setFrameDepth(imageD_);
   }
-  imgPixels_ = imageH_ * imageW_;
-  getOutput().setFrameHeight(imageH_);
-  getOutput().setFrameWidth(imageW_);
+  imgPixels_ = imageH_ * imageW_ * imageD_;
 }
 
 }  // namespace paddle

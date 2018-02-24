@@ -1,153 +1,211 @@
-cmake_minimum_required(VERSION 2.8)
+# Copyright (c) 2016 PaddlePaddle Authors. All Rights Reserve.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License
 
-project(paddle CXX C)
-set(PADDLE_MAJOR_VERSION 0)
-set(PADDLE_MINOR_VERSION 8)
-set(PADDLE_PATCH_VERSION 0b)
-set(PADDLE_VERSION ${PADDLE_MAJOR_VERSION}.${PADDLE_MINOR_VERSION}.${PADDLE_PATCH_VERSION})
+cmake_minimum_required(VERSION 3.0)
+set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+set(PADDLE_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+set(PADDLE_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR})
+SET(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O3 -g -DNDEBUG")
+SET(CMAKE_C_FLAGS_RELWITHDEBINFO "-O3 -g -DNDEBUG")
 
-set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake")
-set(PROJ_ROOT ${CMAKE_SOURCE_DIR})
-include(package)
-include(swig)
-find_package(CUDA QUIET)
-find_package(Protobuf REQUIRED)
-find_package(PythonLibs 2.7 REQUIRED)
-find_package(PythonInterp 2.7 REQUIRED)
-find_package(NumPy)
-find_package(Threads REQUIRED)
-find_package(Glog)
-find_package(Gflags QUIET)
-find_package(GTest)
+include(system)
+
+project(paddle CXX C Go)
+message(STATUS "CXX compiler: " ${CMAKE_CXX_COMPILER} ", version: " ${CMAKE_CXX_COMPILER_VERSION})
+message(STATUS "C compiler: " ${CMAKE_C_COMPILER} ", version: " ${CMAKE_C_COMPILER_VERSION})
+
 find_package(Sphinx)
-find_package(Doxygen)
-include(cblas)
-find_program(M4_EXECUTABLE m4)
-###################### Configurations ###########################
-option(WITH_DSO "Compile PaddlePaddle with dynamic linked libraries" ON)
-option(WITH_GPU "Compile PaddlePaddle with gpu" ${CUDA_FOUND})
-option(WITH_DOUBLE "Compile PaddlePaddle with double precision, otherwise use single precision" OFF)
-option(WITH_AVX "Compile PaddlePaddle with avx intrinsics" ON) # TODO(yuyang18): Check AVX is supported or not as default value
-option(WITH_PYTHON "Compile PaddlePaddle with python interpreter" ON)
-option(WITH_STYLE_CHECK "Style Check for PaddlePaddle" ${PYTHONINTERP_FOUND})
-option(WITH_RDMA "Compile PaddlePaddle with rdma support" OFF)
-option(WITH_GLOG "Compile PaddlePaddle use glog, otherwise use a log implement internally" ${LIBGLOG_FOUND})
-option(WITH_GFLAGS "Compile PaddlePaddle use gflags, otherwise use a flag implement internally" ${GFLAGS_FOUND})
-option(WITH_TIMER "Compile PaddlePaddle use timer" OFF)
-option(WITH_TESTING "Compile and run unittest for PaddlePaddle" ${GTEST_FOUND})
-option(WITH_DOC "Compile PaddlePaddle with documentation" OFF)
-option(WITH_SWIG_PY "Compile PaddlePaddle with py PaddlePaddle prediction api" ${SWIG_FOUND})
-if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING 
-        "Choose the type of build, options are: Debug Release RelWithDebInfo MinSizeRel"
-        FORCE)
+if(NOT CMAKE_CROSSCOMPILING)
+    find_package(CUDA QUIET)
+endif(NOT CMAKE_CROSSCOMPILING)
+find_package(Git REQUIRED)
+find_package(Threads REQUIRED)
+if(NOT ANDROID AND NOT IOS)
+    find_package(Boost QUIET)
 endif()
 
-include(enableCXX11)
-include(cpplint)
-include(ccache)
-include(util)
-include(flags)
-include(cudnn)
-include(FindPythonModule)
-include(check_packages)
+include(simd)
 
-# add PaddlePaddle version
-if(DEFINED ENV{PADDLE_VERSION})
-    add_definitions(-DPADDLE_VERSION=\"$ENV{PADDLE_VERSION}\")
-else()
-    if(EXISTS ${PROJ_ROOT}/.svn/)
-        find_package(Subversion REQUIRED)
-        if(SUBVERSION_FOUND)
-            Subversion_WC_INFO(${PROJ_ROOT} Project)
-            add_definitions(-DPADDLE_VERSION=${Project_WC_REVISION})
+################################ Configurations #######################################
+option(WITH_GPU         "Compile PaddlePaddle with NVIDIA GPU"          ${CUDA_FOUND})
+option(WITH_AVX         "Compile PaddlePaddle with AVX intrinsics"      ${AVX_FOUND})
+option(WITH_MKL         "Compile PaddlePaddle with MKL support."        ${AVX_FOUND})
+option(WITH_DSO         "Compile PaddlePaddle with dynamic linked CUDA" ON)
+option(WITH_TESTING     "Compile PaddlePaddle with unit testing"        ON)
+option(WITH_SWIG_PY     "Compile PaddlePaddle with inference api"       ON)
+option(WITH_STYLE_CHECK "Compile PaddlePaddle with style check"         ON)
+option(WITH_PYTHON      "Compile PaddlePaddle with python interpreter"  ON)
+option(WITH_DOUBLE      "Compile PaddlePaddle with double precision"    OFF)
+option(WITH_RDMA        "Compile PaddlePaddle with RDMA support"        OFF)
+option(WITH_TIMER       "Compile PaddlePaddle with stats timer"         OFF)
+option(WITH_PROFILER    "Compile PaddlePaddle with GPU profiler"        OFF)
+option(WITH_DOC         "Compile PaddlePaddle with documentation"       OFF)
+option(WITH_COVERAGE    "Compile PaddlePaddle with code coverage"       OFF)
+option(COVERALLS_UPLOAD "Package code coverage data to coveralls"       OFF)
+option(ON_TRAVIS        "Exclude special unit test on Travis CI"        OFF)
+option(WITH_C_API       "Compile PaddlePaddle with C-API(Prediction)"   OFF)
+option(WITH_GOLANG      "Compile PaddlePaddle with GOLANG"              OFF)
+option(GLIDE_INSTALL    "Download and install go dependencies "         ON)
+option(USE_NNPACK       "Compile PaddlePaddle with NNPACK library"      OFF)
+option(WITH_DISTRIBUTE  "Compile with grpc distributed support"         OFF)
+option(USE_EIGEN_FOR_BLAS   "Use matrix multiplication in Eigen"        OFF)
+option(WITH_ARM_FP16    "Use half precision support on armv8.2-a cpu"   OFF)
+
+# CMAKE_BUILD_TYPE
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING
+      "Choose the type of build, options are: Debug Release RelWithDebInfo MinSizeRel"
+      FORCE)
+endif()
+
+if(ANDROID OR IOS)
+    if(ANDROID)
+        if(${CMAKE_SYSTEM_VERSION} VERSION_LESS "16")
+            message(FATAL_ERROR "Unsupport standalone toolchains with Android API level lower than 16")
         endif()
     endif()
-endif()
 
+    set(WITH_GPU OFF CACHE STRING
+        "Disable GPU when cross-compiling for Android and iOS" FORCE)
+    set(WITH_AVX OFF CACHE STRING
+        "Disable AVX when cross-compiling for Android and iOS" FORCE)
+    set(WITH_PYTHON OFF CACHE STRING
+        "Disable PYTHON when cross-compiling for Android and iOS" FORCE)
+    set(WITH_RDMA OFF CACHE STRING
+        "Disable RDMA when cross-compiling for Android and iOS" FORCE)
+    set(WITH_MKL OFF CACHE STRING
+        "Disable MKL when cross-compiling for Android and iOS" FORCE)
+    set(WITH_GOLANG OFF CACHE STRING
+        "Disable golang when cross-compiling for Android and iOS" FORCE)
 
-if(NOT WITH_GPU)
-    add_definitions(-DPADDLE_ONLY_CPU)
-    add_definitions(-DHPPL_STUB_FUNC)
-    list(APPEND CMAKE_CXX_SOURCE_FILE_EXTENSIONS cu)
-else()
-    # TODO(yuyang18): Change it to remove std=c++11 in cuda compile.
-    set(CUDA_PROPAGATE_HOST_FLAGS OFF)
-    if(NOT CUDNN_FOUND)
-        message(FATAL_ERROR "Paddle need cudnn to compile")
+    # Compile PaddlePaddle mobile inference library
+    if (NOT WITH_C_API)
+        set(WITH_C_API ON CACHE STRING
+            "Always compile the C_API when cross-compiling for Android and iOS" FORCE)
     endif()
-
-    if(WITH_DSO)
-        set(CUDA_LIBRARIES "")
-        add_definitions(-DPADDLE_USE_DSO)
-    endif(WITH_DSO)
-
-    # Include cuda and cudnn
-    include_directories(${CUDNN_INCLUDE_DIR})
-    include_directories(${CUDA_TOOLKIT_INCLUDE})
-endif(NOT WITH_GPU)
-
-if(WITH_DOUBLE)
-    add_definitions(-DPADDLE_TYPE_DOUBLE -DHPPL_TYPE_DOUBLE)
-    set(ACCURACY double)
-else(WITH_DOUBLE)
-    set(ACCURACY float)
-endif(WITH_DOUBLE)
-
-if(NOT WITH_TIMER)
-    add_definitions(-DPADDLE_DISABLE_TIMER)
-endif(NOT WITH_TIMER)
-
-if(WITH_AVX)
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mavx")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx")
-else(WITH_AVX)
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -msse3")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -msse3")
-endif(WITH_AVX)
-
-if(WITH_PYTHON)
-    include_directories(${PYTHON_INCLUDE_DIR})
-    include_directories(${PYTHON_NUMPY_INCLUDE_DIR})
-else(WITH_PYTHON)
-    add_definitions(-DPADDLE_NO_PYTHON)
-endif(WITH_PYTHON)
-
-if(NOT WITH_RDMA)
-    add_definitions(-DPADDLE_DISABLE_RDMA)
+    set(MOBILE_INFERENCE ON)
+    add_definitions(-DPADDLE_MOBILE_INFERENCE)
 endif()
 
-if(WITH_GLOG)
-    add_definitions(-DPADDLE_USE_GLOG)
+set(THIRD_PARTY_PATH "${CMAKE_BINARY_DIR}/third_party" CACHE STRING
+  "A path setting third party libraries download & build directories.")
+
+if (WITH_C_API AND WITH_PYTHON)
+  message(WARNING "It is suggest not embedded a python interpreter in Paddle "
+    "when using C-API. It will give an unpredictable behavior when using a "
+    "different Python interpreter from compiling.")
 endif()
 
-if(WITH_GFLAGS)
-    add_definitions(-DPADDLE_USE_GFLAGS)
-    add_definitions(-DGFLAGS_NS=${GFLAGS_NAMESPACE})
-    include_directories(${GFLAGS_INCLUDE_DIRS})
-endif()
-
-if(WITH_TESTING)
-    enable_testing()
-    include_directories(${GTEST_INCLUDE_DIRS})
-endif()
-
-include_directories("${CBLAS_INC_DIR}")
-include_directories("${PROJ_ROOT}")
-include_directories("${PROJ_ROOT}/paddle/cuda/include")
-include_directories(${PROTOBUF_INCLUDE_DIRS})
-include_directories("${CMAKE_CURRENT_BINARY_DIR}/proto")
-if(EXISTS "${PROJ_ROOT}/paddle/internals/CMakeLists.txt")
-    set(PADDLE_WITH_INTERNAL ON)
-    include(paddle/internals/CMakeLists.txt)
+if(MOBILE_INFERENCE)
+    set(THIRD_PARTY_BUILD_TYPE MinSizeRel)
 else()
-    set(PADDLE_WITH_INTERNAL OFF)
-    set(INTERNAL_PROTO_PATH "")
+    set(THIRD_PARTY_BUILD_TYPE Release)
 endif()
+
+set(WITH_MKLML ${WITH_MKL})
+if (WITH_MKL AND AVX2_FOUND)
+    set(WITH_MKLDNN ON)
+else()
+    message(STATUS "Do not have AVX2 intrinsics and disabled MKL-DNN")
+    set(WITH_MKLDNN OFF)
+endif()
+
+########################################################################################
+
+include(external/mklml)     # download mklml package
+include(external/zlib)      # download, build, install zlib
+include(external/gflags)    # download, build, install gflags
+include(external/glog)      # download, build, install glog
+include(external/gtest)     # download, build, install gtest
+include(external/protobuf)  # download, build, install protobuf
+include(external/python)    # download, build, install python
+include(external/openblas)  # download, build, install openblas
+include(external/mkldnn)    # download, build, install mkldnn
+include(external/swig)      # download, build, install swig
+include(external/warpctc)   # download, build, install warpctc
+include(external/any)       # download libn::any
+include(external/eigen)     # download eigen3
+include(external/pybind11)  # download pybind11
+include(external/nccl)
+include(external/cares)
+include(external/grpc)
+
+include(cudnn)              # set cudnn libraries, must before configure
+include(configure)          # add paddle env configuration
+include(generic)            # simplify cmake module
+include(package)            # set paddle packages
+include(cpplint)            # set paddle c++ style
+include(ccache)             # set ccache for compilation
+include(util)               # set unittest and link libs
+include(rdma)               # set rdma libraries
+include(flags)              # set paddle compile flags
+include(version)            # set PADDLE_VERSION
+include(coveralls)          # set code coverage
+
+
+include_directories("${PADDLE_SOURCE_DIR}")
+include_directories("${PADDLE_SOURCE_DIR}/paddle/cuda/include")
+include_directories("${CMAKE_CURRENT_BINARY_DIR}/proto")
+include_directories("${CMAKE_CURRENT_BINARY_DIR}/go/pserver/client/c")
+include_directories(${Boost_INCLUDE_DIRS})
+
+set(EXTERNAL_LIBS
+    ${GFLAGS_LIBRARIES}
+    ${GLOG_LIBRARIES}
+    ${CBLAS_LIBRARIES}
+    ${PROTOBUF_LIBRARY}
+    ${ZLIB_LIBRARIES}
+    ${PYTHON_LIBRARIES}
+)
+
+if(WITH_GPU)
+  include(cuda)
+endif(WITH_GPU)
+
+if(WITH_MKLML)
+    list(APPEND EXTERNAL_LIBS ${MKLML_IOMP_LIB})
+endif()
+
+if(WITH_MKLDNN)
+    list(APPEND EXTERNAL_LIBS ${MKLDNN_LIB})
+endif()
+
+if(USE_NNPACK)
+    include(external/nnpack)
+    list(APPEND EXTERNAL_LIBS ${NNPACK_LIBS})
+endif(USE_NNPACK)
+
 add_subdirectory(proto)
+
+if(NOT MOBILE_INFERENCE)
+    # "add_subdirectory(go)" should be placed after the following loine,
+    # because it depends on paddle/optimizer.
+    add_subdirectory(paddle/optimizer)
+endif()
+
+# "add_subdirectory(paddle)" and "add_subdirectory(python)" should be
+# placed after this block, because they depends on it.
+if(WITH_GOLANG)
+    add_subdirectory(go)
+endif(WITH_GOLANG)
+
+set(PADDLE_PYTHON_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/python/build")
 add_subdirectory(paddle)
-add_subdirectory(python)
+if(WITH_PYTHON)
+  add_subdirectory(python)
+endif()
+
 if(WITH_DOC)
     add_subdirectory(doc)
-    add_subdirectory(doc_cn)
 endif()

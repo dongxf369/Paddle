@@ -1,4 +1,4 @@
-/* Copyright (c) 2016 Baidu, Inc. All Rights Reserve.
+/* Copyright (c) 2016 PaddlePaddle Authors. All Rights Reserve.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -12,9 +12,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
 
-
 #include "paddle/utils/Stat.h"
-#ifndef PADDLE_ONLY_CPU
+#ifdef PADDLE_WITH_CUDA
 #include "hl_batch_transpose.h"
 #endif
 #include "BatchNormalizationLayer.h"
@@ -22,8 +21,6 @@ limitations under the License. */
 namespace paddle {
 
 REGISTER_LAYER(batch_norm, BatchNormalizationLayer);
-
-const real BatchNormalizationLayer::EPS = 1E-5;
 
 bool BatchNormalizationLayer::init(const LayerMap& layerMap,
                                    const ParameterMap& parameterMap) {
@@ -41,11 +38,11 @@ void BatchNormalizationLayer::calMeanAndStd(const MatrixPtr& mat) {
   savedMean_->mulScalar(1.0 / numSamples);  // E[x]
 
   tmpMat_->assign(*mat);
-  tmpMat_->square();
+  tmpMat_->square2();
   savedInvVar_->zeroMem();
   savedInvVar_->accumulateColSum(*tmpMat_);
-  savedInvVar_->mulScalar(1.0 / numSamples);  // E[x^2]
-  savedInvVar_->addSquare(*savedMean_, -1.0);      // E[x^2] - E^2[x]
+  savedInvVar_->mulScalar(1.0 / numSamples);   // E[x^2]
+  savedInvVar_->addSquare(*savedMean_, -1.0);  // E[x^2] - E^2[x]
 
   // Variance may be small negative value
   // because of the subtraction operation.
@@ -54,30 +51,20 @@ void BatchNormalizationLayer::calMeanAndStd(const MatrixPtr& mat) {
 
   calMovingMeanAndVar();
 
-  savedInvVar_->subScalar(-EPS);
-  savedInvVar_->sqrt(*savedInvVar_);
+  savedInvVar_->subScalar(-epsilon_);
+  savedInvVar_->sqrt2(*savedInvVar_);
 }
 
 void BatchNormalizationLayer::calMovingMeanAndVar() {
   // calculating and saving moving mean and variance
-  MatrixPtr movingMean = movingMean_->getW();
-  MatrixPtr movingVar = movingVar_->getW();
-
-  if (!useGpu_ && FLAGS_trainer_count > 1) {
-    auto mvMean = std::dynamic_pointer_cast<SharedCpuMatrix>(movingMean);
-    auto mvVar = std::dynamic_pointer_cast<SharedCpuMatrix>(movingVar);
-    CHECK(mvMean && mvVar);
-
-    mvMean->add(*savedMean_, movingAvgFraction_, 1.0 - movingAvgFraction_);
-    mvVar->add(*savedInvVar_, movingAvgFraction_, 1.0 - movingAvgFraction_);
-  } else {
-    // movingMean =  movingMean * movingAvgFraction_
-    //            + savedMean_ * (1 - movingAvgFraction_)
-    movingMean->add(*savedMean_, movingAvgFraction_, 1.0 - movingAvgFraction_);
-    // movingVar =  movingVar * movingAvgFraction_
-    //           + savedInvVar_ * (1 - movingAvgFraction_)
-    movingVar->add(*savedInvVar_, movingAvgFraction_, 1.0 - movingAvgFraction_);
-  }
+  auto& movingMean = movingMean_->getW();
+  auto& movingVar = movingVar_->getW();
+  // movingMean =  movingMean * movingAvgFraction_
+  //            + savedMean_ * (1 - movingAvgFraction_)
+  movingMean->add(*savedMean_, movingAvgFraction_, 1.0 - movingAvgFraction_);
+  // movingVar =  movingVar * movingAvgFraction_
+  //           + savedInvVar_ * (1 - movingAvgFraction_)
+  movingVar->add(*savedInvVar_, movingAvgFraction_, 1.0 - movingAvgFraction_);
 }
 
 void BatchNormalizationLayer::setMeanAndStd() {
@@ -85,8 +72,8 @@ void BatchNormalizationLayer::setMeanAndStd() {
   savedInvVar_->copyFrom(*(movingVar_->getW()));
   savedInvVar_->downClip(real(0.0));
 
-  savedInvVar_->subScalar(-EPS);
-  savedInvVar_->sqrt(*savedInvVar_);
+  savedInvVar_->subScalar(-epsilon_);
+  savedInvVar_->sqrt2(*savedInvVar_);
 }
 
 void BatchNormalizationLayer::expandMat(const MatrixPtr& in, MatrixPtr& out) {
@@ -101,20 +88,26 @@ void BatchNormalizationLayer::expandMat(const MatrixPtr& in, MatrixPtr& out) {
   size_t batchSize = in->getHeight();
   CHECK_EQ(out->getHeight(), batchSize * imgPixels_);
   if (useGpu_) {
-#ifdef PADDLE_ONLY_CPU
+#ifndef PADDLE_WITH_CUDA
     LOG(FATAL) << "paddle is compiled only for cpu";
 #else
-    batchTranspose(in->getData(), out->getData(), imgPixels_,
-                   channels_, batchSize);
+    batchTranspose(
+        in->getData(), out->getData(), imgPixels_, channels_, batchSize);
 #endif
   } else {
     for (size_t i = 0; i < batchSize; i++) {
       const MatrixPtr inTmp =
-          Matrix::create(in->getData() + i * imgPixels_ * channels_, channels_,
-                         imgPixels_, false, useGpu_);
+          Matrix::create(in->getData() + i * imgPixels_ * channels_,
+                         channels_,
+                         imgPixels_,
+                         false,
+                         useGpu_);
       MatrixPtr outTmp =
           Matrix::create(out->getData() + i * imgPixels_ * channels_,
-                         imgPixels_, channels_, false, useGpu_);
+                         imgPixels_,
+                         channels_,
+                         false,
+                         useGpu_);
       inTmp->transpose(outTmp, false);
     }
   }
@@ -132,25 +125,29 @@ void BatchNormalizationLayer::shrinkMat(const MatrixPtr& in, MatrixPtr& out) {
   }
   CHECK_EQ(in->getHeight(), static_cast<size_t>(batchSize * imgPixels_));
   if (useGpu_) {
-#ifdef PADDLE_ONLY_CPU
+#ifndef PADDLE_WITH_CUDA
     LOG(FATAL) << "paddle is compiled only for cpu";
 #else
-    batchTranspose(in->getData(), out->getData(), channels_,
-                   imgPixels_, batchSize);
+    batchTranspose(
+        in->getData(), out->getData(), channels_, imgPixels_, batchSize);
 #endif
   } else {
     for (size_t i = 0; i < batchSize; i++) {
       const MatrixPtr inTmp =
-          Matrix::create(in->getData() + i * channels_ * imgPixels_, imgPixels_,
-                         channels_, false, useGpu_);
+          Matrix::create(in->getData() + i * channels_ * imgPixels_,
+                         imgPixels_,
+                         channels_,
+                         false,
+                         useGpu_);
       MatrixPtr outTmp =
-          Matrix::create(out->getData() + i * imgPixels_ * channels_, channels_,
-                         imgPixels_, useGpu_);
+          Matrix::create(out->getData() + i * imgPixels_ * channels_,
+                         channels_,
+                         imgPixels_,
+                         useGpu_);
       inTmp->transpose(outTmp, false);
     }
   }
 }
-
 
 void BatchNormalizationLayer::forward(PassType passType) {
   Layer::forward(passType);
@@ -165,12 +162,12 @@ void BatchNormalizationLayer::forward(PassType passType) {
     useGlobalStats_ = config_.use_global_stats();
   }
 
-  Matrix::resizeOrCreate(expandedIn_, batchSize * imgPixels_, channels_, false,
-                         useGpu_);
-  Matrix::resizeOrCreate(normIn_, batchSize * imgPixels_, channels_, false,
-                         useGpu_);
-  Matrix::resizeOrCreate(expandedOut_, batchSize * imgPixels_, channels_, false,
-                         useGpu_);
+  Matrix::resizeOrCreate(
+      expandedIn_, batchSize * imgPixels_, channels_, false, useGpu_);
+  Matrix::resizeOrCreate(
+      normIn_, batchSize * imgPixels_, channels_, false, useGpu_);
+  Matrix::resizeOrCreate(
+      expandedOut_, batchSize * imgPixels_, channels_, false, useGpu_);
   expandMat(getInputValue(0), expandedIn_);
 
   if (useGlobalStats_) {
@@ -184,7 +181,7 @@ void BatchNormalizationLayer::forward(PassType passType) {
   }
 
   normIn_->assign(*expandedIn_);
-  normIn_->addBias(*savedMean_, -1);  // subtract mean.
+  normIn_->addBias(*savedMean_, -1);     // subtract mean.
   normIn_->divRowVector(*savedInvVar_);  // divide std.
 
   expandedOut_->assign(*normIn_);
@@ -211,18 +208,18 @@ void BatchNormalizationLayer::backward(const UpdateCallback& callback) {
   Matrix::resizeOrCreate(meanGrad_, 1, channels_, false, useGpu_);
   Matrix::resizeOrCreate(stdGrad_, 1, channels_, false, useGpu_);
 
-  Matrix::resizeOrCreate(expandedInGrad_, batchSize * imgPixels_, channels_,
-                         false, useGpu_);
-  Matrix::resizeOrCreate(inGrad_, batchSize, imgPixels_ * channels_, false,
-                         useGpu_);
-  Matrix::resizeOrCreate(normInGrad_, batchSize * imgPixels_, channels_, false,
-                         useGpu_);
-  Matrix::resizeOrCreate(expandedOutGrad_, batchSize * imgPixels_, channels_,
-                         false, useGpu_);
-  Matrix::resizeOrCreate(tmpMat_, batchSize * imgPixels_, channels_, false,
-                         useGpu_);
-  Matrix::resizeOrCreate(tmpGrad_, batchSize * imgPixels_, channels_, false,
-                         useGpu_);
+  Matrix::resizeOrCreate(
+      expandedInGrad_, batchSize * imgPixels_, channels_, false, useGpu_);
+  Matrix::resizeOrCreate(
+      inGrad_, batchSize, imgPixels_ * channels_, false, useGpu_);
+  Matrix::resizeOrCreate(
+      normInGrad_, batchSize * imgPixels_, channels_, false, useGpu_);
+  Matrix::resizeOrCreate(
+      expandedOutGrad_, batchSize * imgPixels_, channels_, false, useGpu_);
+  Matrix::resizeOrCreate(
+      tmpMat_, batchSize * imgPixels_, channels_, false, useGpu_);
+  Matrix::resizeOrCreate(
+      tmpGrad_, batchSize * imgPixels_, channels_, false, useGpu_);
 
   expandMat(getOutputGrad(), expandedOutGrad_);
 
